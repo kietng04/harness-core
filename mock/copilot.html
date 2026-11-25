@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock Copilot</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #17181c; color: #e8e8ea;
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 12px 18px; border-bottom: 1px solid #2a2c33;
+    display: flex; align-items: center; gap: 10px; font-weight: 600;
+  }
+  header small { color: #9aa0aa; font-weight: 400; }
+  #messages { flex: 1; overflow: auto; padding: 20px 18px 120px; }
+  article { max-width: 900px; margin: 0 auto 14px; display: flex; }
+  article.user { justify-content: flex-end; }
+  .bubble {
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    padding: 10px 14px; border-radius: 12px; max-width: 86%;
+    background: #24262c;
+  }
+  article.user .bubble { background: #2f5f4a; }
+  article.system .bubble { background: #333024; color: #d9cf9f; font-size: 13px; }
+  article.assistant .bubble { background: #24262c; }
+  pre {
+    margin: 0; padding: 10px 12px; border-radius: 10px; max-width: 100%;
+    overflow-x: auto; background: #0f1013; border: 1px solid #30323a;
+  }
+  code { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #composer-wrap {
+    position: fixed; left: 0; right: 0; bottom: 0; padding: 14px 18px;
+    background: linear-gradient(transparent, #17181c 25%);
+    display: flex; gap: 8px; align-items: flex-end; justify-content: center;
+  }
+  #composer {
+    width: min(900px, 100%); min-height: 48px; max-height: 160px; overflow: auto;
+    padding: 12px 14px; border-radius: 14px; background: #24262c;
+    border: 1px solid #3a3d46; outline: none; white-space: pre-wrap;
+  }
+  #composer:focus { border-color: #5f8f78; }
+  #composer:empty::before { content: "Message Copilot"; color: #858a94; }
+  button {
+    border: 1px solid #3a3d46; background: #2a2d34; color: #e8e8ea;
+    border-radius: 10px; padding: 10px 14px; cursor: pointer; font: inherit;
+  }
+  button:hover { background: #343842; }
+  #stop { border-color: #8b3a3a; background: #4a2626; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>Mock Copilot <small id="status">ready</small></header>
+<main id="messages" role="log" aria-live="polite"></main>
+<div id="composer-wrap">
+  <input id="file" type="file" style="display:none">
+  <button id="attach" type="button" aria-label="Attach file" title="Attach file">Attach</button>
+  <div id="composer" contenteditable="true" role="textbox"
+       data-testid="composer-input" aria-label="Message Copilot"></div>
+  <button id="stop" data-testid="stop-button" type="button" hidden>Stop</button>
+  <button id="send" data-testid="send" aria-label="Send" type="button">Send</button>
+</div>
+<script>
+(() => {
+  const messages = document.getElementById('messages');
+  const composer = document.getElementById('composer');
+  const sendBtn = document.getElementById('send');
+  const stopBtn = document.getElementById('stop');
+  const fileInput = document.getElementById('file');
+  const attachBtn = document.getElementById('attach');
+  const status = document.getElementById('status');
+
+  const NL = '\n';
+  let sends = 0;
+  let busy = false;
+  let attached = '';
+
+  // The scripted Copilot. Each user message consumes one reply. The ATTACH
+  // turn is followed by the harness uploading mock-output.txt and sending a
+  // short continuation, so the last reply can prove the upload happened.
+  const replies = [
+    ['bash', '# note: checking the workspace before we touch anything', 'pwd', 'echo mock-ok'].join(NL),
+    ['bash', '# note: writing a file and reading it back to verify output', "echo 'hello from mock' > mock-output.txt", 'cat mock-output.txt'].join(NL),
+    ['ATTACH', '{"file":"mock-output.txt"}'].join(NL),
+  ];
+
+  function replyFor(index) {
+    const custom = window.__mockReplies;
+    if (Array.isArray(custom)) {
+      if (index < custom.length) {
+        const item = custom[index];
+        if (typeof item === 'string') return item;
+        if (item && typeof item.reply === 'string') return item.reply;
+        return '';
+      }
+      if (custom.fallback != null) return String(custom.fallback);
+      return ['DONE', 'Mock script exhausted.'].join(NL);
+    }
+    if (index < replies.length) return replies[index];
+    return [
+      'DONE',
+      'Mock loop complete.',
+      'attachment=' + (attached || 'none'),
+      'sends=' + sends,
+    ].join(NL);
+  }
+
+  function scrollDown() {
+    messages.scrollTop = messages.scrollHeight;
+  }
+
+  function appendTurn(cls, text) {
+    const article = document.createElement('article');
+    article.setAttribute('data-testid', 'conversation-turn');
+    article.className = cls;
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.textContent = text;
+    article.appendChild(bubble);
+    messages.appendChild(article);
+    scrollDown();
+    return article;
+  }
+
+  function appendCodeTurn() {
+    const article = document.createElement('article');
+    article.setAttribute('data-testid', 'conversation-turn');
+    article.className = 'assistant';
+    const pre = document.createElement('pre');
+    const code = document.createElement('code');
+    pre.appendChild(code);
+    article.appendChild(pre);
+    messages.appendChild(article);
+    scrollDown();
+    return code;
+  }
+
+  function finish() {
+    busy = false;
+    stopBtn.hidden = true;
+    status.textContent = 'ready';
+  }
+
+  function send() {
+    if (busy) return;
+    const text = composer.innerText.trim();
+    if (!text) return;
+
+    appendTurn('user', text);
+    composer.innerHTML = '';
+    sends++;
+    busy = true;
+    status.textContent = 'thinking';
+    stopBtn.hidden = false;
+
+    const rev = (text.match(/^REVISION:\s*([A-Za-z0-9._:-]+)/m) || [])[1] || '';
+    const reply = replyFor(sends - 1)
+      .replace(/\{\{sends\}\}/g, String(sends))
+      .replace(/\{\{revision\}\}/g, rev);
+    setTimeout(() => {
+      const code = appendCodeTurn();
+      let shown = 0;
+      const step = Math.max(3, Math.ceil(reply.length / 45));
+      const timer = setInterval(() => {
+        shown = Math.min(reply.length, shown + step);
+        code.textContent = reply.slice(0, shown);
+        scrollDown();
+        if (shown >= reply.length) {
+          clearInterval(timer);
+          code.textContent = reply;
+          setTimeout(finish, 180);
+        }
+      }, 35);
+    }, 280);
+  }
+
+  sendBtn.addEventListener('click', send);
+  composer.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+  attachBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    attached = file.name;
+    appendTurn('system', 'Attached: ' + file.name + ' (' + file.size + ' bytes)');
+    status.textContent = 'file attached';
+  });
+
+  appendTurn('assistant', 'Mock Copilot ready. Send a goal to start.');
+})();
+</script>
+</body>
+</html>

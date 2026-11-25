@@ -1,0 +1,22 @@
+{
+  "name": "edge-copilot-harness",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Drive Edge Copilot chat from the terminal: Copilot writes bash, the harness runs it and sends the output back.",
+  "bin": {
+    "copilot-harness": "./agent.js",
+    "copilot-tui": "./tui.mjs"
+  },
+  "scripts": {
+    "selftest": "node agent.js --selftest",
+    "test": "node agent.js --selftest && node test/e2e-mock.js && node test/mcp-smoke.js && node test/regression.js && node test/pty-tui.js",
+    "tui": "node tui.mjs",
+    "mock": "node agent.js --mock",
+    "mcp": "node mcp-server.js"
+  },
+  "dependencies": {
+    "ink": "^8.0.0",
+    "playwright-core": "^1.65.1",
+    "react": "^19.3.1"
+  }
+}
