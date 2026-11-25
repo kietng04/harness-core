@@ -257,6 +257,16 @@ async function runAndFormat(argv, cwd, mode, requestId) {
     }
   }
 
+  const metrics = result.metrics;
+  if (metrics) {
+    lines.push('metrics: sends=' + (metrics.sends || 0)
+      + ' promptBytes=' + (metrics.promptBytes || 0)
+      + ' execMs=' + (metrics.execMs || 0)
+      + ' toolMs=' + (metrics.toolMs || 0)
+      + ' verifyMs=' + (metrics.verifyMs || 0)
+      + ' reviewMs=' + (metrics.reviewMs || 0));
+  }
+
   if (Array.isArray(result.artifactPaths) && result.artifactPaths.length) {
     lines.push('artifacts: ' + result.artifactPaths.join(', '));
   }

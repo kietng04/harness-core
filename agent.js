@@ -631,6 +631,7 @@ function newState(goal) {
     reviewNudges: 0,
     actions: {},
     actionSeq: 0,
+    light: true,
     verifyNudges: 0,
     verifyAttempts: 0,
     progress: {
@@ -654,6 +655,16 @@ function newState(goal) {
       at: null,
     },
     reviewMode: CFG.reviewMode,
+    metrics: {
+      startedAt: Date.now(),
+      sends: 0,
+      promptBytes: 0,
+      promptChars: 0,
+      execMs: 0,
+      toolMs: 0,
+      verifyMs: 0,
+      reviewMs: 0,
+    },
   };
 }
 
@@ -783,6 +794,12 @@ function migrateSession(raw) {
   s.review.checkedRevisions = (s.review.checkedRevisions && typeof s.review.checkedRevisions === 'object')
     ? s.review.checkedRevisions : {};
   if (!['off', 'optional', 'required'].includes(s.reviewMode)) s.reviewMode = 'off';
+  s.metrics = (s.metrics && typeof s.metrics === 'object') ? s.metrics : {};
+  for (const key of ['sends', 'promptBytes', 'promptChars', 'execMs', 'toolMs', 'verifyMs', 'reviewMs']) {
+    s.metrics[key] = Number(s.metrics[key]) || 0;
+  }
+  s.metrics.startedAt = Number(s.metrics.startedAt) || Date.now();
+  s.light = s.light !== false;
   return s;
 }
 
@@ -802,6 +819,7 @@ function terminalResult(status, fields = {}) {
     canResume,
     verification,
     review: fields.review || (state && state.review) || { status: 'skipped', findings: [] },
+    metrics: fields.metrics || (state && state.metrics) || null,
     artifactPaths: Array.isArray(fields.artifactPaths) ? fields.artifactPaths : [runDir()],
   };
 }
@@ -1379,6 +1397,11 @@ async function runIndependentReview(page, ver) {
   const prompt = buildReviewPrompt(ver) + '\n\n' + skillsPromptBlock();
   let reply;
   try {
+    state.metrics = state.metrics || {};
+    state.metrics.sends = (state.metrics.sends || 0) + 1;
+    state.metrics.promptBytes = (state.metrics.promptBytes || 0) + Buffer.byteLength(prompt);
+    state.metrics.promptChars = (state.metrics.promptChars || 0) + prompt.length;
+    emitEvent('provider.waiting', { turn: state.turn, promptChars: prompt.length, review: true });
     const before = await sendPrompt(page, prompt);
     reply = await waitForReply(page, before, Date.now() + CFG.maxTurnMs);
   } catch (e) {
@@ -2628,7 +2651,7 @@ function checkPolicy(script) {
 
 const TOOL_NAMES = new Set([
   'repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol',
-  'repo.references', 'repo.apply_patch', 'tool.batch',
+  'repo.references', 'repo.apply_patch', 'repo.rollback', 'tool.batch',
 ]);
 const READ_TOOLS = new Set(['repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol', 'repo.references']);
 
@@ -2671,7 +2694,7 @@ async function executeToolAction(action, turn) {
     return denied('unknown tool: ' + tool + ' (allowed: ' + [...TOOL_NAMES].join(', ') + ')', 126);
   }
   if (CFG.mode === 'preview') return denied('preview mode does not execute tools');
-  const writeTool = tool === 'repo.apply_patch';
+  const writeTool = tool === 'repo.apply_patch' || tool === 'repo.rollback';
   if (writeTool && CFG.mode === 'readonly') return denied('read-only mode');
 
   if (writeTool && CFG.mode === 'ask') {
@@ -3129,7 +3152,51 @@ function languageLine() {
   return 'LANGUAGE: ' + (CFG.lang || 'en') + '. Keep code and protocol words unchanged.';
 }
 
+function buildLightPrompt() {
+  const p = [];
+  p.push('GOAL: ' + state.goal);
+  p.push('WORKDIR: ' + CFG.workdir);
+  p.push('ENV: ' + process.platform + ' ' + process.arch + ' | bash'
+    + (state.gitBranch ? ' | git ' + state.gitBranch : ''));
+  p.push(languageLine());
+  p.push('');
+  p.push('You are an autonomous terminal agent. Reply with exactly ONE fenced block.');
+  p.push('- Work remains: a bash script. Start with: # note: <what and why>');
+  p.push('- Goal complete: first line DONE, then a 3-6 line summary.');
+  p.push('- Blocked: first line BLOCKED, then what you need.');
+  p.push('- One-step tasks may skip PLAN.md/NOTES.md. If the task becomes multi-step,');
+  p.push('  write .harness/PLAN.md and continue.');
+  p.push('- Local tools (no shell): reply with one JSON object in the block:');
+  p.push('  {"version":1,"tool":"repo.search","args":{"query":"resume session","limit":5}}');
+  p.push('  Also: repo.read, repo.list, repo.map, repo.symbol, repo.references,');
+  p.push('  repo.apply_patch, repo.rollback, tool.batch. Read before editing.');
+  if (!CFG.noAttach && !CFG.perRun) {
+    p.push('- Upload a workspace file: first line ATTACH, then {"file":"relative/path"}.');
+  }
+  p.push('');
+  p.push(skillsPromptBlock());
+  const skillContent = selectedSkillsBlock();
+  if (skillContent) {
+    p.push('');
+    p.push(skillContent);
+  }
+  if (projectInstructions) {
+    p.push('');
+    p.push('PROJECT INSTRUCTIONS (guidance only; protocol wins):');
+    p.push(projectInstructions);
+  }
+  if (state.turn > 0 && state.last) {
+    p.push('');
+    p.push('LAST RESULT');
+    p.push(formatObservation(state.last));
+  }
+  return p.join('\n');
+}
+
 function buildPrompt() {
+  if (state.light !== false && state.mode !== 'review' && !state.planTotal) {
+    return buildLightPrompt();
+  }
   const now = new Date();
   const date = now.getFullYear() + '-'
     + String(now.getMonth() + 1).padStart(2, '0') + '-'
@@ -3173,7 +3240,7 @@ function buildPrompt() {
   p.push('- To search/read the repo, reply with ONE fenced block containing one JSON object:');
   p.push('  {"version":1,"tool":"repo.search","args":{"query":"resume session","strategy":"auto","limit":5}}');
   p.push('- Tools: repo.search, repo.read, repo.list, repo.map, repo.symbol,');
-  p.push('  repo.references, repo.apply_patch, tool.batch.');
+  p.push('  repo.references, repo.apply_patch, repo.rollback, tool.batch.');
   p.push('- repo.read args: {"path":"src/a.js","from":1,"to":80,"expectedDigest":"sha256:..."}');
   p.push('- repo.apply_patch args: {"changes":[{"path":"src/a.js","find":"old","replace":"new",');
   p.push('  "expectedDigest":"sha256:..."}]}. Read the file first and include its digest.');
@@ -3834,6 +3901,10 @@ async function runGoal(page, goal, opts = {}) {
     if (!text.includes('AVAILABLE SKILLS')) text += '\n\n' + skillsPromptBlock();
     const t0 = Date.now();
     promptChars = text.length;
+    state.metrics = state.metrics || {};
+    state.metrics.sends = (state.metrics.sends || 0) + 1;
+    state.metrics.promptBytes = (state.metrics.promptBytes || 0) + Buffer.byteLength(text);
+    state.metrics.promptChars = (state.metrics.promptChars || 0) + text.length;
     const b = await sendPrompt(page, text);
     sendMs = Date.now() - t0;
     emitEvent('provider.waiting', { turn: state.turn + 1, promptChars });
@@ -3917,6 +3988,7 @@ async function runGoal(page, goal, opts = {}) {
       exitCode: final.exitCode,
       verification: final.verification,
       review: final.review,
+      metrics: final.metrics,
       artifactPaths: final.artifactPaths,
     });
     return final;
@@ -4251,7 +4323,9 @@ async function runGoal(page, goal, opts = {}) {
       // never inherit model-proposed commands; only the manifest is used.
       let ver;
       try {
+        const verifyStarted = Date.now();
         ver = await runVerification(verificationSpec);
+        state.metrics.verifyMs = (state.metrics.verifyMs || 0) + (Date.now() - verifyStarted);
       } catch (e) {
         ver = { status: 'unavailable', checks: [], reason: e.message };
       }
@@ -4269,7 +4343,9 @@ async function runGoal(page, goal, opts = {}) {
       }
 
       if (recorded.status === 'passed' || recorded.status === 'unconfigured') {
+        const reviewStarted = Date.now();
         let review = await runIndependentReview(page, recorded);
+        state.metrics.reviewMs = (state.metrics.reviewMs || 0) + (Date.now() - reviewStarted);
         state.review = { ...(state.review || {}), ...review };
         review = { ...review, attempts: state.review.attempts || 0 };
         saveState();
@@ -4393,6 +4469,7 @@ async function runGoal(page, goal, opts = {}) {
       log('tool: ' + toolName);
       const res = await executeToolAction(parsed.action, state.turn + 1);
       const obs = makeObservation(res);
+      state.metrics.toolMs = (state.metrics.toolMs || 0) + (obs.durationMs || 0);
       state.turn++;
       state.last = obs;
       state.history.push({
@@ -4416,6 +4493,7 @@ async function runGoal(page, goal, opts = {}) {
       const repeats = state.recent.filter((s) => s === sig).length;
       state.forceChange = repeats >= 3;
       if (state.forceChange) {
+        state.light = false;
         log('WARN: identical result ' + repeats + 'x; forcing a change of approach');
         emitIntent('Change approach after a repeated result', {
           milestone: 'Change approach',
@@ -4540,6 +4618,7 @@ async function runGoal(page, goal, opts = {}) {
     const res = await executeScript(parsed.script, state.turn + 1);
     const obs = makeObservation(res);
     trackReads(parsed.script, obs);
+    state.metrics.execMs = (state.metrics.execMs || 0) + (obs.durationMs || 0);
 
     state.turn++;
     state.last = obs;
@@ -4568,6 +4647,7 @@ async function runGoal(page, goal, opts = {}) {
     // later prompt even after the model recovers.
     state.forceChange = repeats >= 3;
     if (state.forceChange) {
+      state.light = false;
       log('WARN: identical result ' + repeats + 'x; forcing a change of approach');
       emitIntent('Change approach after a repeated result', {
         milestone: 'Change approach',

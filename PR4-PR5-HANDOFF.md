@@ -24,6 +24,8 @@ lexical + BM25 + structure + Vietnamese/English expansion, **not embeddings**.
 - `repo.apply_patch`: `changes[]` with optional `expectedDigest`; validates all
   before writing, writes a journal under `.harness/journal/`, atomically renames,
   invalidates the search cache, rejects readonly/preview.
+- `repo.rollback`: reads an applied/partial patch journal, requires current file
+  digest to equal the journal's after-image, then atomically restores before-text.
 - `tool.batch`: up to 3 read-only actions, bounded output.
 
 ## Search behavior
@@ -62,6 +64,16 @@ PTY OK
 
 ## Still not done from the full plan
 
-PR6 is partially covered by `repo.apply_patch` but rollback is not exposed as a
-tool yet. PR7 (context ledger), PR8 (graph retrieval/diagnostics), full PR0
-policy engine, and the section 8.2 A/B reviewer measurement remain open.
+PR6 is partially covered by `repo.apply_patch` + `repo.rollback`; diff/change
+journal recovery is smaller than the full design. PR7 (context ledger), PR8
+(graph retrieval/diagnostics), full PR0 policy engine remain open.
+
+## Added with this slice
+
+- Light default prompt (~1 KB for a one-step goal) instead of the ~3.6 KB full
+  prompt; escalates to full prompt when PLAN exists or repeated results are seen.
+- `metrics` in result/run.finished/MCP: provider sends, prompt UTF-8 bytes,
+  exec/tool/verify/review milliseconds.
+- `test/ab-review.js`: same fixture with and without the reviewer, two samples
+  per side, p50 sends/bytes/wall time. It proves the reviewer costs exactly one
+  extra provider turn and reports the extra bytes/time.

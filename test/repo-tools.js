@@ -103,6 +103,12 @@ const after = fs.readFileSync(path.join(work, 'src', 'filter.js'), 'utf8');
 check('patch applied', after.includes('x != null'), true);
 check('patch cache invalidated', fs.existsSync(search.cachePath(work)), false);
 
+const rollback = tools.runTool(work, 'repo.rollback', { journal: patch.data.journal }, 23);
+check('rollback ok', rollback.ok, true);
+check('rollback restored', fs.readFileSync(path.join(work, 'src', 'filter.js'), 'utf8'), before);
+const secondRollback = tools.runTool(work, 'repo.rollback', { journal: patch.data.journal }, 24);
+check('rollback stale guard', secondRollback.code, 'stale_revision');
+
 // Batch read-only.
 const batch = tools.runTool(work, 'tool.batch', {
   actions: [
@@ -166,6 +172,15 @@ check('agent tool read coverage', JSON.stringify(session.reads['src/resume-state
 const resultMatch = String(e2e.stdout || '').match(/^__HARNESS_RESULT__(\{.*\})$/m);
 const result = resultMatch ? JSON.parse(resultMatch[1]) : null;
 check('agent tool done', result && result.status, 'done');
+
+// Light default prompt: one-step goal stays bounded and still lists skills.
+const light = spawnSync(process.execPath, [
+  AGENT, '--prompt', '--workdir', work, '--', 'run pwd and echo ok',
+], { cwd: ROOT, encoding: 'utf8', timeout: 30000 });
+check('light prompt exit', light.status, 0);
+check('light prompt bounded', Buffer.byteLength(light.stdout) < 1600, true);
+check('light prompt skills once', (light.stdout.match(/AVAILABLE SKILLS/g) || []).length, 1);
+includes('light prompt tools', light.stdout, 'repo.search');
 
 if (failures) {
   console.error('\nREPO TOOLS FAILED: ' + failures + ' assertion(s)');

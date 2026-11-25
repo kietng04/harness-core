@@ -173,6 +173,7 @@ function applyPatch(workspace, args = {}, actionId) {
       path: p.rel,
       beforeDigest: p.digest,
       afterDigest: p.nextDigest,
+      beforeText: p.before,
     })),
     status: 'prepared',
   };
@@ -213,6 +214,61 @@ function applyPatch(workspace, args = {}, actionId) {
   };
 }
 
+function rollback(workspace, args = {}, actionId) {
+  workspace = canonicalRoot(workspace);
+  const rel = String(args.journal || '');
+  const journalAbs = insidePath(workspace, rel);
+  if (!journalAbs || !/\.harness[\/\\]journal[\/\\]/.test(toPosix(journalAbs))) {
+    return { ok: false, code: 'out_of_scope', error: 'journal must live under .harness/journal' };
+  }
+  let journal;
+  try { journal = JSON.parse(fs.readFileSync(journalAbs, 'utf8')); } catch (e) {
+    return { ok: false, code: 'not_found', error: 'cannot read journal: ' + e.message };
+  }
+  if (!journal || !Array.isArray(journal.changes) || !journal.changes.length) {
+    return { ok: false, code: 'invalid_args', error: 'journal has no changes' };
+  }
+  if (!['applied', 'partial'].includes(journal.status)) {
+    return { ok: false, code: 'policy_denied', error: 'only applied/partial journals can roll back' };
+  }
+  const prepared = [];
+  for (const change of journal.changes) {
+    const abs = insidePath(workspace, change.path);
+    if (!abs) return { ok: false, code: 'out_of_scope', error: 'path outside workspace: ' + change.path };
+    let current;
+    try { current = fs.readFileSync(abs, 'utf8'); } catch (e) {
+      return { ok: false, code: 'not_found', error: 'cannot read ' + change.path + ': ' + e.message };
+    }
+    const digest = 'sha256:' + sha256(current);
+    if (digest !== change.afterDigest) {
+      return { ok: false, code: 'stale_revision', error: 'current file changed since patch: ' + change.path, data: { digest } };
+    }
+    if (typeof change.beforeText !== 'string') {
+      return { ok: false, code: 'tool_error', error: 'journal has no beforeText for ' + change.path };
+    }
+    prepared.push({ abs, rel: change.path, beforeText: change.beforeText });
+  }
+  for (const item of prepared) {
+    const tmp = item.abs + '.harness-rollback-' + process.pid;
+    const st = fs.statSync(item.abs);
+    fs.writeFileSync(tmp, item.beforeText, { mode: st.mode });
+    fs.renameSync(tmp, item.abs);
+  }
+  const out = {
+    version: 1,
+    actionId: actionId || null,
+    at: new Date().toISOString(),
+    workspace,
+    rollbackOf: journalAbs,
+    status: 'applied',
+    files: prepared.map((p) => p.rel),
+  };
+  const outFile = path.join(workspace, '.harness', 'journal', 'rollback-' + String(actionId || Date.now()) + '.json');
+  fs.writeFileSync(outFile, JSON.stringify(out, null, 2));
+  try { fs.rmSync(search.cachePath(workspace), { force: true }); } catch {}
+  return { ok: true, data: { journal: toPosix(path.relative(workspace, outFile)), files: out.files } };
+}
+
 function runBatch(workspace, args = {}) {
   const actions = Array.isArray(args.actions) ? args.actions.slice(0, 3) : [];
   if (!actions.length) return { ok: false, code: 'invalid_args', error: 'actions[] is required (max 3)' };
@@ -248,6 +304,9 @@ function runTool(workspace, name, args = {}, opts = {}) {
     case 'repo.apply_patch':
       if (opts.readonly) return { ok: false, code: 'policy_denied', error: 'read-only mode' };
       return applyPatch(workspace, args, opts.actionId);
+    case 'repo.rollback':
+      if (opts.readonly) return { ok: false, code: 'policy_denied', error: 'read-only mode' };
+      return rollback(workspace, args, opts.actionId);
     case 'tool.batch': return runBatch(workspace, args);
     default:
       return { ok: false, code: 'invalid_args', error: 'unknown tool: ' + name };
@@ -257,6 +316,7 @@ function runTool(workspace, name, args = {}, opts = {}) {
 module.exports = {
   runTool,
   applyPatch,
+  rollback,
   mapRepo,
   symbolRepo,
   referencesRepo,

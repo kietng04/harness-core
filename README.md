@@ -228,6 +228,11 @@ khi mọi check pass.
 
 ### Result và resume
 
+- Task một bước dùng prompt ngắn (~1 KB); tự chuyển prompt đầy đủ khi có PLAN
+  hoặc khi kết quả lặp lại.
+- Result có `metrics`: `sends`, `promptBytes`, `execMs`, `toolMs`, `verifyMs`,
+  `reviewMs` để đo chi phí từng phần.
+
 Mỗi invocation có một terminal result:
 
 | status | exit | canResume | Ý nghĩa |
@@ -317,8 +322,9 @@ Copilot dùng typed tool qua fenced JSON:
 ```
 
 Các tool: `repo.search`, `repo.read`, `repo.list`, `repo.map`, `repo.symbol`,
-`repo.references`, `repo.apply_patch`, `tool.batch`. Patch validate digest,
-ghi journal `.harness/journal/`, atomic rename; readonly/preview bị chặn.
+`repo.references`, `repo.apply_patch`, `repo.rollback`, `tool.batch`. Patch validate digest,
+ghi journal `.harness/journal/`, atomic rename; readonly/preview bị chặn; rollback
+chỉ chạy khi file hiện tại đúng after-digest.
 TUI cũng có `/search <query>` và `/index`.
 
 ### Ảnh từ clipboard
