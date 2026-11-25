@@ -116,6 +116,8 @@ const path = require('path');
 const readline = require('readline');
 const crypto = require('crypto');
 const { pathToFileURL } = require('url');
+const repoSearch = require('./repo-search');
+const repoTools = require('./repo-tools');
 
 /* ------------------------------------------------------------------ config */
 
@@ -567,7 +569,9 @@ async function requestApproval(kind, payload, actionId) {
   emitPhase('approval', { kind, actionId: id });
   log('');
   log('CẦN DUYỆT · ' + (kind === 'bash' ? 'Chạy bash'
-    : kind === 'verify' ? 'Chạy verification manifest' : 'Gửi file'));
+    : kind === 'verify' ? 'Chạy verification manifest'
+      : kind === 'tool' ? 'Chạy tool ' + (payload.tool || '')
+        : 'Gửi file'));
   log('  Workspace: ' + CFG.workdir);
   if (kind === 'bash') {
     log('  Quyền:     shell trên máy, theo quyền user');
@@ -576,6 +580,9 @@ async function requestApproval(kind, payload, actionId) {
   } else if (kind === 'verify') {
     log('  Manifest:  ' + (payload.manifest || ''));
     log('  Checks:    ' + (payload.checks || []).join(', '));
+  } else if (kind === 'tool') {
+    log('  Tool:      ' + (payload.tool || ''));
+    log('  Args:      ' + JSON.stringify(payload.args || {}).slice(0, 600));
   } else {
     log('  Quyền:     shell trên máy, theo quyền user');
     log('  File: ' + payload.file + ' (' + payload.bytes + ' bytes)');
@@ -2546,6 +2553,17 @@ function parseReply(text) {
 
   const first = t.split('\n')[0].trim();
 
+  // Typed local tool envelope. Bash stays the default fallback.
+  if (first.startsWith('{')) {
+    try {
+      const action = JSON.parse(t);
+      if (action && typeof action === 'object' && action.version === 1
+        && typeof action.tool === 'string') {
+        return { kind: 'tool', action };
+      }
+    } catch {}
+  }
+
   // A lone language label is not a script. Do NOT strip "bash" when it is
   // followed by a filename: "bash run.sh" is a valid command.
   if (/^(bash|sh|shell|zsh|console|powershell)$/i.test(first) && t.split('\n').length === 1) {
@@ -2608,6 +2626,12 @@ function checkPolicy(script) {
   return { ok: true };
 }
 
+const TOOL_NAMES = new Set([
+  'repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol',
+  'repo.references', 'repo.apply_patch', 'tool.batch',
+]);
+const READ_TOOLS = new Set(['repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol', 'repo.references']);
+
 /* ------------------------------------------------------------------- exec */
 
 function killTree(pid) {
@@ -2616,6 +2640,88 @@ function killTree(pid) {
     return;
   }
   try { process.kill(-pid, 'SIGKILL'); } catch {}
+}
+
+async function executeToolAction(action, turn) {
+  const tool = String(action.tool || '');
+  const args = (action.args && typeof action.args === 'object' && !Array.isArray(action.args))
+    ? action.args : {};
+  const turnDir = path.join(CFG.home, 'runs', CFG.runId || 'adhoc', 'turns', String(turn).padStart(3, '0'));
+  fs.mkdirSync(turnDir, { recursive: true });
+  const actionId = nextActionId();
+  const note = progressText(action.note || '', 160);
+  emitIntent(note || ('Local tool · ' + tool), action.progress || {}, turn, actionId);
+  emitEvent('action.proposed', {
+    kind: 'tool',
+    tool,
+    args,
+    turn,
+    actionId,
+    workspace: CFG.workdir,
+  });
+
+  const denied = (reason, code = 125) => {
+    const msg = 'TOOL DENIED: ' + reason;
+    fs.writeFileSync(path.join(turnDir, 'tool-result.json'), JSON.stringify({ ok: false, code: 'policy_denied', error: reason }, null, 2));
+    emitEvent('action.finished', { kind: 'tool', tool, turn, actionId, exit: code, denied: true, reason });
+    return { exit: code, output: msg, durationMs: 0, bytes: msg.length, runDir: turnDir, denied: true };
+  };
+
+  if (!TOOL_NAMES.has(tool)) {
+    return denied('unknown tool: ' + tool + ' (allowed: ' + [...TOOL_NAMES].join(', ') + ')', 126);
+  }
+  if (CFG.mode === 'preview') return denied('preview mode does not execute tools');
+  const writeTool = tool === 'repo.apply_patch';
+  if (writeTool && CFG.mode === 'readonly') return denied('read-only mode');
+
+  if (writeTool && CFG.mode === 'ask') {
+    const approval = await requestApproval('tool', { tool, args }, actionId);
+    if (!approval.approve) return denied('user denied: ' + (approval.reason || 'no reason'));
+  }
+
+  const started = Date.now();
+  beginAction(actionId, 'tool', turn, {
+    tool,
+    args: JSON.stringify(args).slice(0, 4000),
+  });
+  let result;
+  try {
+    result = repoTools.runTool(CFG.workdir, tool, args, {
+      actionId,
+      readonly: CFG.mode === 'readonly',
+    });
+  } catch (e) {
+    result = { ok: false, code: 'tool_error', error: e.message };
+  }
+  const durationMs = Date.now() - started;
+  if (result && result.ok && tool === 'repo.read' && result.data) {
+    addReadRange(result.data.path, result.data.from, result.data.to);
+  }
+  const output = 'TOOL ' + tool + (result.ok ? ' ok' : ' error [' + result.code + ']') + '\n'
+    + clampMiddle(JSON.stringify(result, null, 2), 24000);
+  fs.writeFileSync(path.join(turnDir, 'tool-result.json'), output, 'utf8');
+  const artifactRef = path.relative(runDir(), path.join(turnDir, 'tool-result.json')).split(path.sep).join('/');
+  const exit = result.ok ? 0 : 1;
+  finishAction(actionId, { exit, code: result.code || null, durationMs }, [artifactRef]);
+  emitEvent('action.finished', {
+    kind: 'tool',
+    tool,
+    turn,
+    actionId,
+    exit,
+    code: result.code || null,
+    durationMs,
+  });
+  return {
+    exit,
+    output,
+    durationMs,
+    bytes: output.length,
+    runDir: turnDir,
+    tool,
+    result,
+    artifactRef,
+  };
 }
 
 async function executeScript(script, turn) {
@@ -3062,6 +3168,16 @@ function buildPrompt() {
   p.push('- Optional second comment line when the direction changes:');
   p.push('  # progress: {"milestone":"short name","changeReason":"why it changed"}');
   p.push('  Valid JSON only; both fields are optional. The harness ignores malformed metadata.');
+  p.push('');
+  p.push('LOCAL REPO TOOLS (in-process, no shell; reads are safe)');
+  p.push('- To search/read the repo, reply with ONE fenced block containing one JSON object:');
+  p.push('  {"version":1,"tool":"repo.search","args":{"query":"resume session","strategy":"auto","limit":5}}');
+  p.push('- Tools: repo.search, repo.read, repo.list, repo.map, repo.symbol,');
+  p.push('  repo.references, repo.apply_patch, tool.batch.');
+  p.push('- repo.read args: {"path":"src/a.js","from":1,"to":80,"expectedDigest":"sha256:..."}');
+  p.push('- repo.apply_patch args: {"changes":[{"path":"src/a.js","find":"old","replace":"new",');
+  p.push('  "expectedDigest":"sha256:..."}]}. Read the file first and include its digest.');
+  p.push('- Search hits are excerpts. Call repo.read on current source before editing.');
 
   if (review) {
     p.push('- DEPTH OVER BREADTH: read the implementation, not just file names.');
@@ -4260,6 +4376,86 @@ async function runGoal(page, goal, opts = {}) {
       });
     }
 
+    if (parsed.kind === 'tool') {
+      if (state.turn - startTurn >= CFG.maxTurns) {
+        return finishGoal({
+          status: 'partial',
+          reason: 'turn budget reached (' + CFG.maxTurns + ') before executing tool',
+          turns: state.turn,
+          canResume: true,
+          summary: 'Chưa hoàn tất: hết ngân sách action. /continue để tiếp tục.',
+          verification: currentVerification(),
+        });
+      }
+      const toolName = String(parsed.action.tool || '');
+      log('');
+      log('--- turn ' + (state.turn + 1) + ' ---');
+      log('tool: ' + toolName);
+      const res = await executeToolAction(parsed.action, state.turn + 1);
+      const obs = makeObservation(res);
+      state.turn++;
+      state.last = obs;
+      state.history.push({
+        turn: state.turn,
+        script: 'TOOL ' + toolName + ' ' + JSON.stringify(parsed.action.args || {}).slice(0, 600),
+        exit: obs.exit,
+        head: obs.body.slice(0, 400),
+      });
+      if (state.history.length > 50) state.history.shift();
+      log('exit=' + obs.exit + ' in ' + obs.durationMs + 'ms (' + obs.lines + ' lines)');
+      log('timing: send ' + (sendMs / 1000).toFixed(1)
+        + 's | copilot ' + (waitMs / 1000).toFixed(1)
+        + 's | tool ' + (obs.durationMs / 1000).toFixed(1)
+        + 's | prompt ' + (promptChars / 1000).toFixed(1)
+        + 'k chars (~' + (promptChars / 4000).toFixed(1) + 'k tok)');
+      syncMemory();
+
+      const sig = signature(obs);
+      state.recent.push(sig);
+      if (state.recent.length > 6) state.recent.shift();
+      const repeats = state.recent.filter((s) => s === sig).length;
+      state.forceChange = repeats >= 3;
+      if (state.forceChange) {
+        log('WARN: identical result ' + repeats + 'x; forcing a change of approach');
+        emitIntent('Change approach after a repeated result', {
+          milestone: 'Change approach',
+          changeReason: 'same result repeated ' + repeats + ' times',
+        }, state.turn);
+      }
+      if (repeats >= 5) {
+        saveState();
+        throw new HarnessError('stuck', 'Same tool result 5 times. Aborting to avoid burning turns.');
+      }
+      saveState();
+
+      if (state.turn - startTurn >= CFG.maxTurns) {
+        finalTurn = true;
+        log('TURN BUDGET: action budget used; allowing one final DONE/BLOCKED turn');
+        before = await send(buildFinalPrompt());
+        continue;
+      }
+
+      if (!CFG.mock && !CFG.perRun && state.turn > 0 && state.turn % CFG.resetAfterTurns === 0) {
+        emitPhase('compacting', { turn: state.turn, reason: 'auto-compact threshold' });
+        log('__HARNESS_COMPACT__' + JSON.stringify({
+          phase: 'request', turn: state.turn, afterTurns: CFG.resetAfterTurns,
+        }));
+        const hand = await requestCompact(page);
+        if (hand.ok && hand.summary.trim()) {
+          state.compactSummary = clampTail(hand.summary, CFG.maxCompactChars);
+          state.compacts = (state.compacts || 0) + 1;
+          saveState();
+        }
+        await resetChat(page);
+        const ready = await firstVisible(page, SEL.composer, 30000);
+        if (!ready) throw new HarnessError('compact_failed', 'New chat did not open a composer; auto-compact aborted safely.');
+        lastFreshTurn = state.turn;
+        emitPhase('preparing', { turn: state.turn, reason: 'compact complete' });
+      }
+      before = await send(buildPrompt());
+      continue;
+    }
+
     const canon = canonicalScript(parsed.script);
     const requested = requestedSkill(parsed.script);
 
@@ -4886,6 +5082,8 @@ function usage() {
     '  node agent.js --probe                inspect selectors on the live page',
     '  node agent.js --prompt "goal"        print the first prompt, no browser',
     '  node agent.js --context              show repo instructions + memory + git',
+    '  node agent.js --search "query"      local BM25 repo search (no network)',
+    '  node agent.js --index                build/update the local search index',
     '  node agent.js --selftest             run unit tests (no browser)',
     '  node agent.js --mock                 local end-to-end test (headless Edge)',
     '  node agent.js --json "goal"          machine-readable result (used by MCP)',
@@ -4912,7 +5110,7 @@ function usage() {
 
 const VALUE_FLAGS = new Set([
   '--session', '--cdp', '--chat-url', '--max-turns', '--max-total-ms',
-  '--max-turn-ms', '--profile', '--workdir', '--auto-compact', '--verify', '--lang',
+  '--max-turn-ms', '--profile', '--workdir', '--auto-compact', '--verify', '--lang', '--search',
 ]);
 
 function parseArgv(argv) {
@@ -5066,6 +5264,24 @@ async function main() {
     for (const item of plan.open) log('  [ ] ' + item);
     const git = gitSummary();
     log('GIT: ' + (git ? '\n' + git : 'clean or not a repo'));
+    return;
+  }
+
+  if (flags.has('--index')) {
+    const result = repoSearch.search(CFG.workdir, { query: 'index', limit: 1, buildTimeoutMs: 15000 });
+    const info = result.ok ? result.data.index : { error: result.error };
+    process.stdout.write(JSON.stringify(info, null, 2) + '\n');
+    return;
+  }
+
+  if (values['--search']) {
+    const result = repoSearch.search(CFG.workdir, {
+      query: values['--search'],
+      strategy: 'auto',
+      limit: 5,
+    });
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    if (!result.ok) process.exitCode = 2;
     return;
   }
 

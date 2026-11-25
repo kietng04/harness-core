@@ -293,6 +293,34 @@ một chat riêng (mock dùng cùng page để fixture điều khiển reply), c
   `invalid`. Required + thiếu kết quả → `partial` lý do `review_*`; optional giữ
   kết quả verifier và hiện trạng thái review.
 
+### Local code search (offline)
+
+Harness có local code intelligence, **không phải semantic embedding**:
+
+```bash
+node agent.js --index
+node agent.js --search "khôi phục phiên"
+```
+
+- Tokenizer tách `camelCase`, `snake_case`, `kebab-case`, Unicode.
+- BM25 + exact path/symbol boost + synonym Việt–Anh.
+- Index cache `.harness/index/repo-search-v1.json`, incremental theo mtime/size.
+- Skip `.git`, `.harness`, `node_modules`, binary, file quá lớn, symlink escape.
+- `repo.read` trả digest và range hiện tại trước khi sửa.
+
+Copilot dùng typed tool qua fenced JSON:
+
+```json
+{"version":1,"tool":"repo.search","args":{"query":"resume session","strategy":"auto","limit":5}}
+{"version":1,"tool":"repo.read","args":{"path":"src/a.js","from":1,"to":80}}
+{"version":1,"tool":"repo.apply_patch","args":{"changes":[{"path":"src/a.js","find":"old","replace":"new"}]}}
+```
+
+Các tool: `repo.search`, `repo.read`, `repo.list`, `repo.map`, `repo.symbol`,
+`repo.references`, `repo.apply_patch`, `tool.batch`. Patch validate digest,
+ghi journal `.harness/journal/`, atomic rename; readonly/preview bị chặn.
+TUI cũng có `/search <query>` và `/index`.
+
 ### Ảnh từ clipboard
 
 Trong TUI bấm **Ctrl+V** để lấy ảnh PNG từ clipboard macOS, hoặc gõ:
@@ -353,6 +381,8 @@ node agent.js --max-turns 20 "goal"     # ngân sách action mỗi invocation
 node agent.js --probe                   # kiểm tra selector trên page thật
 node agent.js --prompt "goal"           # in prompt đầu, không mở browser
 node agent.js --context                # repo instructions + plan + git
+node agent.js --search "khôi phục phiên" # local BM25 search
+node agent.js --index                  # build/update search index
 node agent.js --selftest               # unit tests
 node agent.js --mock                   # E2E bằng mock Copilot + headless Edge
 node agent.js --json "goal"            # in __HARNESS_RESULT__{...} cho MCP

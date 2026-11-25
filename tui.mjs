@@ -13,6 +13,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const repoSearch = require('./repo-search.js');
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const AGENT = process.env.HARNESS_AGENT_BIN
@@ -49,6 +53,8 @@ const SLASH = [
   ['/review', 'toggle the independent reviewer'],
   ['/skills', 'list .cursor/skills'],
   ['/skill <name>', 'use a skill for the next goal'],
+  ['/search <query>', 'local BM25 repo search'],
+  ['/index', 'build/update the local search index'],
   ['/image <path>', 'stage an image for the next goal'],
   ['/paste', 'paste a clipboard image (macOS)'],
   ['/status', 'show Edge / mode / session'],
@@ -865,12 +871,16 @@ function App({ opts }) {
               ? 'Cần xác nhận · Chạy bash  [a] duyệt · [x] từ chối'
               : p.kind === 'verify'
                 ? 'Cần xác nhận · Verification  [a] duyệt · [x] từ chối'
-                : 'Cần xác nhận · Gửi file  [a] duyệt · [x] từ chối';
+                : p.kind === 'tool'
+                  ? 'Cần xác nhận · Tool ' + (p.tool || '') + '  [a] duyệt · [x] từ chối'
+                  : 'Cần xác nhận · Gửi file  [a] duyệt · [x] từ chối';
             const detail = p.kind === 'bash'
               ? String(p.script || '').split('\n').slice(0, 6).join('\n')
               : p.kind === 'verify'
                 ? (p.manifest || '') + ' · ' + (p.checks || []).join(', ')
-                : (p.file || '') + ' (' + (p.bytes || 0) + ' bytes)';
+                : p.kind === 'tool'
+                  ? JSON.stringify(p.args || {}).slice(0, 600)
+                  : (p.file || '') + ' (' + (p.bytes || 0) + ' bytes)';
             addBlock({ type: 'info', text: head + '\n  ' + detail });
           } else if (ev.type === 'approval.granted' || ev.type === 'approval.denied') {
             approvalRef.current = null;
@@ -1099,6 +1109,8 @@ function App({ opts }) {
           '  /continue         resume <cwd>/.harness/session.json',
           '  /skills           list .cursor/skills',
           '  /skill <name>     use a skill for the next goal',
+          '  /search <query>   local BM25 repo search',
+          '  /index            build/update local search index',
           '  /image <path>     stage an image for the next goal',
           '  /paste            paste a clipboard image (macOS)',
           '  /status           Edge, mode, cwd, session',
@@ -1192,6 +1204,38 @@ function App({ opts }) {
       }
       setPinnedSkill(found.name);
       addBlock({ type: 'info', text: 'Skill cho goal tiếp theo: ' + found.label });
+      return;
+    }
+    if (cmd === '/search') {
+      if (!arg) {
+        addBlock({ type: 'info', text: 'Dùng: /search <query>. Ví dụ /search khôi phục phiên' });
+        return;
+      }
+      const result = repoSearch.search(cwd, { query: arg, strategy: 'auto', limit: 5 });
+      if (!result.ok) {
+        addBlock({ type: 'error', text: result.error || 'search failed' });
+        return;
+      }
+      const hits = result.data.hits || [];
+      addBlock({
+        type: 'info',
+        text: hits.length
+          ? 'Search · ' + result.data.strategy + ' · ' + result.data.index.files + ' files\n'
+            + hits.map((h, i) => '  ' + (i + 1) + '. ' + h.path + ':' + h.from + '-' + h.to
+              + (h.symbol ? ' · ' + h.symbol : '') + '  (' + h.reason + ')').join('\n')
+          : 'Search: không có hit. Thử query ngắn hơn hoặc /index.',
+      });
+      return;
+    }
+    if (cmd === '/index') {
+      const result = repoSearch.search(cwd, { query: 'index', limit: 1, buildTimeoutMs: 15000 });
+      addBlock({
+        type: 'info',
+        text: result.ok
+          ? 'Index: ' + result.data.index.files + ' files · changed '
+            + result.data.index.changed + ' · ' + result.data.index.durationMs + 'ms'
+          : 'Index lỗi: ' + (result.error || 'unknown'),
+      });
       return;
     }
     if (cmd === '/image') {
