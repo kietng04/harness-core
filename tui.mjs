@@ -85,7 +85,7 @@ function usage() {
     '',
     'Inside the TUI:',
     '  Type a goal and press Enter. /help lists slash commands.',
-    '  PgUp/PgDn scroll, Esc stops a run, Ctrl+O toggles command details.',
+    '  PgUp/PgDn scroll, Ctrl+V pastes a clipboard image, Ctrl+O toggles command details.',
     '',
     'The engine is agent.js: Edge Copilot writes bash, the harness runs it in',
     'the current directory and sends the output back until DONE/BLOCKED.',
@@ -252,12 +252,18 @@ function clipboardImage(cwd) {
   const dir = path.join(cwd, '.harness', 'attachments');
   fs.mkdirSync(dir, { recursive: true });
   const out = path.join(dir, 'clipboard-' + Date.now() + '.png');
-  execFileSync('osascript', [
-    '-e', 'set png to the clipboard as «class PNGf»',
-    '-e', 'set f to open for access POSIX file ' + JSON.stringify(out) + ' with write permission',
-    '-e', 'write png to f',
-    '-e', 'close access f',
-  ], { timeout: 8000 });
+  if (process.env.HARNESS_CLIPBOARD_IMAGE) {
+    const src = path.resolve(process.env.HARNESS_CLIPBOARD_IMAGE);
+    if (!fs.existsSync(src)) throw new Error('Clipboard image fixture không tồn tại: ' + src);
+    fs.copyFileSync(src, out);
+  } else {
+    execFileSync('osascript', [
+      '-e', 'set png to the clipboard as «class PNGf»',
+      '-e', 'set f to open for access POSIX file ' + JSON.stringify(out) + ' with write permission',
+      '-e', 'write png to f',
+      '-e', 'close access f',
+    ], { timeout: 8000 });
+  }
   if (!fs.existsSync(out) || fs.statSync(out).size === 0) {
     throw new Error('Clipboard không có ảnh PNG.');
   }
@@ -1101,7 +1107,7 @@ function App({ opts }) {
           '  /clear            clear transcript',
           '  /quit             exit',
           '',
-          'Keys: Enter send · PgUp/PgDn scroll · Esc stop/clear · Ctrl+O details · Ctrl+X quit',
+          'Keys: Enter send · Ctrl+V paste ảnh · PgUp/PgDn scroll · Esc stop/clear · Ctrl+O details · Ctrl+X quit',
         ].join('\n'),
       });
       return;
@@ -1317,6 +1323,16 @@ function App({ opts }) {
       }
       return;
     }
+    if ((key.ctrl || key.meta) && (ch === 'v' || ch === '\x16')) {
+      try {
+        const img = clipboardImage(liveRef.current.cwd);
+        setPendingImage(img);
+        addBlock({ type: 'info', text: 'Đã dán ảnh: ' + img.rel + ' (' + img.bytes + ' bytes)' });
+      } catch (error) {
+        addBlock({ type: 'error', text: error.message });
+      }
+      return;
+    }
     if (key.ctrl && ch === 'o') {
       setDetails((v) => !v);
       return;
@@ -1487,7 +1503,7 @@ function App({ opts }) {
       + (plan.next ? '  ·  next: ' + plan.next.slice(0, 52) : '');
     progressColor = 'gray';
   } else {
-    progress = 'ready  ·  ⏎ send  ·  /help  ·  ctrl+o details';
+    progress = 'ready  ·  ⏎ send  ·  ctrl+v dán ảnh  ·  /help  ·  ctrl+o details';
   }
   if (shownScroll > 0) {
     if (cols < 80) progress = '↑' + shownScroll + '  ·  ' + progress;

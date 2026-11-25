@@ -293,6 +293,19 @@ một chat riêng (mock dùng cùng page để fixture điều khiển reply), c
   `invalid`. Required + thiếu kết quả → `partial` lý do `review_*`; optional giữ
   kết quả verifier và hiện trạng thái review.
 
+### Ảnh từ clipboard
+
+Trong TUI bấm **Ctrl+V** để lấy ảnh PNG từ clipboard macOS, hoặc gõ:
+
+```text
+/paste
+/image /duong/dan/anh.png
+```
+
+Ảnh được lưu vào `.harness/attachments/`, goal kế tiếp tự thêm dòng
+`IMAGE TO ATTACH: ...` và agent upload bằng protocol `ATTACH` trước khi làm việc.
+Terminal không nhận binary paste trực tiếp; `Ctrl+V`/`/paste` là đường dẫn ảnh.
+
 ### Skills trong `.cursor/skills`
 
 Mỗi prompt (đầu, delta, resume, compact, retry, review) đều có đúng một khối

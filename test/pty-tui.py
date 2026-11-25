@@ -83,6 +83,8 @@ def main():
         os.write(master, data)
 
     ok_ready = wait_for(["ready", "Ask Copilot", "copilot-harness"], 15)
+    send(b"\x16")
+    ok_image = wait_for(["Đã dán ảnh", "Clipboard không có"], 10)
     send(b"layout fixture\r")
     ok_approval = wait_for(["Cần xác nhận", "từ chối"], 20)
     before_scroll = len(raw)
@@ -110,6 +112,7 @@ def main():
         "cols": cols,
         "rows": rows,
         "ready": ok_ready,
+        "imagePaste": ok_image and ("Đã dán ảnh" in body),
         "approval": ok_approval,
         "result": ok_result,
         "phase": ("Đang chờ Copilot" in body) or ("Chờ duyệt" in body),
