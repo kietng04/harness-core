@@ -8,7 +8,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { render, Box, Text, useApp, useInput, useStdout } from 'ink';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -47,6 +47,10 @@ const SLASH = [
   ['/continue', 'resume .harness/session.json'],
   ['/verify', 'set a verification manifest'],
   ['/review', 'toggle the independent reviewer'],
+  ['/skills', 'list .cursor/skills'],
+  ['/skill <name>', 'use a skill for the next goal'],
+  ['/image <path>', 'stage an image for the next goal'],
+  ['/paste', 'paste a clipboard image (macOS)'],
   ['/status', 'show Edge / mode / session'],
   ['/login', 'launch Edge and wait for Copilot sign-in'],
   ['/probe', 'inspect Copilot selectors'],
@@ -183,6 +187,81 @@ function formatResultSummary(result) {
   }
   if (result.canResume && result.status !== 'done') lines.push('Resume: /continue · .harness/session.json');
   return lines.join('\n');
+}
+
+const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp|heic|tiff?)$/i;
+
+function readSkills(cwd) {
+  const base = path.join(cwd, '.cursor', 'skills');
+  if (!fs.existsSync(base)) return [];
+  let realBase;
+  try { realBase = fs.realpathSync(base); } catch { return []; }
+  const found = [];
+  const walk = (dir, depth) => {
+    if (depth > 6 || found.length >= 100) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (entry.name === 'SKILL.md') {
+        let real;
+        try { real = fs.realpathSync(full); } catch { continue; }
+        const relToBase = path.relative(realBase, real);
+        if (!relToBase || relToBase.startsWith('..') || path.isAbsolute(relToBase)) continue;
+        let text = '';
+        try { text = fs.readFileSync(full, 'utf8'); } catch { continue; }
+        const m = text.match(/^---\s*\n([\s\S]*?)\n---/);
+        let name = '';
+        if (m) {
+          const line = m[1].split('\n').find((l) => /^\s*name\s*:/.test(l));
+          if (line) name = line.replace(/^\s*name\s*:\s*/, '').trim().replace(/^["']|["']$/g, '').trim();
+        }
+        if (!name) name = path.basename(path.dirname(full));
+        found.push({ name, rel: path.relative(cwd, full).split(path.sep).join('/') });
+      }
+    }
+  };
+  walk(base, 0);
+  const counts = {};
+  for (const s of found) counts[s.name] = (counts[s.name] || 0) + 1;
+  for (const s of found) s.label = counts[s.name] > 1 ? s.name + ' (' + s.rel + ')' : s.name;
+  return found.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function stageImage(cwd, src) {
+  const abs = path.resolve(cwd, String(src || '').replace(/^~/, os.homedir()));
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error('Ảnh không tồn tại: ' + abs);
+  const st = fs.statSync(abs);
+  if (st.size > 10 * 1024 * 1024) throw new Error('Ảnh quá lớn (max 10 MB): ' + abs);
+  let rel = path.relative(cwd, abs).split(path.sep).join('/');
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    const dir = path.join(cwd, '.harness', 'attachments');
+    fs.mkdirSync(dir, { recursive: true });
+    const dest = path.join(dir, path.basename(abs));
+    fs.copyFileSync(abs, dest);
+    rel = path.relative(cwd, dest).split(path.sep).join('/');
+  }
+  return { abs, rel, bytes: st.size };
+}
+
+function clipboardImage(cwd) {
+  if (process.platform !== 'darwin') {
+    throw new Error('Paste clipboard chỉ hỗ trợ macOS. Dùng /image <path>.');
+  }
+  const dir = path.join(cwd, '.harness', 'attachments');
+  fs.mkdirSync(dir, { recursive: true });
+  const out = path.join(dir, 'clipboard-' + Date.now() + '.png');
+  execFileSync('osascript', [
+    '-e', 'set png to the clipboard as «class PNGf»',
+    '-e', 'set f to open for access POSIX file ' + JSON.stringify(out) + ' with write permission',
+    '-e', 'write png to f',
+    '-e', 'close access f',
+  ], { timeout: 8000 });
+  if (!fs.existsSync(out) || fs.statSync(out).size === 0) {
+    throw new Error('Clipboard không có ảnh PNG.');
+  }
+  return { abs: out, rel: path.relative(cwd, out).split(path.sep).join('/'), bytes: fs.statSync(out).size };
 }
 
 function phaseStatusText({ phase, direction, verification, review, activeSummary, spinner, phaseElapsed, compact }) {
@@ -492,6 +571,9 @@ function App({ opts }) {
   const [phase, setPhase] = useState({ name: 'preparing', label: PHASE_LABEL.preparing, since: 0, detail: null });
   const [verification, setVerification] = useState(null);
   const [reviewInfo, setReviewInfo] = useState(null);
+  const [skills, setSkills] = useState(() => readSkills(opts.cwd));
+  const [pinnedSkill, setPinnedSkill] = useState('');
+  const [pendingImage, setPendingImage] = useState(null);
 
   const idRef = useRef(10);
   const childRef = useRef(null);
@@ -554,6 +636,9 @@ function App({ opts }) {
 
   useEffect(() => {
     setPlan(readPlan(cwd));
+    setSkills(readSkills(cwd));
+    setPinnedSkill('');
+    setPendingImage(null);
   }, [cwd]);
 
   const refreshEdge = useCallback(async () => {
@@ -1006,6 +1091,10 @@ function App({ opts }) {
           '  /compact          start a new Copilot chat now',
           '  /cwd <path>       change project directory',
           '  /continue         resume <cwd>/.harness/session.json',
+          '  /skills           list .cursor/skills',
+          '  /skill <name>     use a skill for the next goal',
+          '  /image <path>     stage an image for the next goal',
+          '  /paste            paste a clipboard image (macOS)',
           '  /status           Edge, mode, cwd, session',
           '  /login            launch Edge and sign in',
           '  /probe            inspect Copilot selectors',
@@ -1073,6 +1162,59 @@ function App({ opts }) {
       runAgent({ resume: true });
       return;
     }
+    if (cmd === '/skills') {
+      const list = readSkills(cwd);
+      addBlock({
+        type: 'info',
+        text: list.length
+          ? 'Skills:\n' + list.map((s) => '  ' + s.label + '  ·  ' + s.rel).join('\n')
+          : 'Không có skill trong .cursor/skills.',
+      });
+      return;
+    }
+    if (cmd === '/skill') {
+      if (!arg) {
+        addBlock({ type: 'info', text: 'Dùng: /skill <name>. Xem /skills.' });
+        return;
+      }
+      const list = readSkills(cwd);
+      const found = list.find((s) => s.label.toLowerCase() === arg.toLowerCase())
+        || list.find((s) => s.name.toLowerCase() === arg.toLowerCase());
+      if (!found) {
+        addBlock({ type: 'error', text: 'Không thấy skill: ' + arg + '. Dùng /skills.' });
+        return;
+      }
+      setPinnedSkill(found.name);
+      addBlock({ type: 'info', text: 'Skill cho goal tiếp theo: ' + found.label });
+      return;
+    }
+    if (cmd === '/image') {
+      if (!arg) {
+        addBlock({ type: 'info', text: 'Dùng: /image <path>. Ảnh sẽ được gửi kèm goal tiếp theo.' });
+        return;
+      }
+      if (!IMAGE_RE.test(arg)) {
+        addBlock({ type: 'warn', text: 'Không phải đuôi ảnh thông dụng: ' + arg });
+      }
+      try {
+        const img = stageImage(cwd, arg);
+        setPendingImage(img);
+        addBlock({ type: 'info', text: 'Ảnh chờ gửi: ' + img.rel + ' (' + img.bytes + ' bytes)' });
+      } catch (error) {
+        addBlock({ type: 'error', text: error.message });
+      }
+      return;
+    }
+    if (cmd === '/paste') {
+      try {
+        const img = clipboardImage(cwd);
+        setPendingImage(img);
+        addBlock({ type: 'info', text: 'Đã dán ảnh: ' + img.rel + ' (' + img.bytes + ' bytes)' });
+      } catch (error) {
+        addBlock({ type: 'error', text: error.message });
+      }
+      return;
+    }
     if (cmd === '/status') {
       addBlock({ type: 'info', text: 'cwd: ' + cwd + ' · mode: ' + mode + (readonly ? ' · review' : '') + (mock ? ' · mock' : '') + ' · max: ' + maxTurns + (verify ? ' · verify: ' + verify : '') + ' · reviewer: ' + reviewMode });
       refreshEdge().then((e) => {
@@ -1109,10 +1251,23 @@ function App({ opts }) {
     addBlock({ type: 'error', text: 'Unknown command: ' + cmd + '. Try /help.' });
   }, [addBlock, autoCompact, cwd, maxTurns, mode, mock, readonly, refreshEdge, reviewMode, runAgent, quit, verify, welcomeBlocks]);
 
+  const slashItems = useMemo(() => [
+    ...SLASH,
+    ...skills.map((s) => ['/skill ' + s.name, 'dùng skill ' + s.label]),
+  ], [skills]);
+
   const suggestions = useMemo(() => {
-    if (running || !input.startsWith('/') || /\s/.test(input)) return [];
-    return SLASH.filter(([cmd]) => cmd.startsWith(input)).slice(0, 6);
-  }, [input, running]);
+    if (running || !input.startsWith('/')) return [];
+    if (/^\/skill\s+/i.test(input)) {
+      const q = input.replace(/^\/skill\s+/i, '').toLowerCase();
+      return skills
+        .filter((s) => s.name.toLowerCase().startsWith(q) || s.label.toLowerCase().startsWith(q))
+        .slice(0, 6)
+        .map((s) => ['/skill ' + s.name, 'dùng skill ' + s.label]);
+    }
+    if (/\s/.test(input)) return [];
+    return slashItems.filter(([cmd]) => cmd.startsWith(input)).slice(0, 6);
+  }, [input, running, slashItems, skills]);
 
   const submit = useCallback((forced) => {
     if (runningRef.current) return;
@@ -1129,12 +1284,26 @@ function App({ opts }) {
       handleCommand(raw.trim());
       return;
     }
+    let goal = raw.trim();
+    const attach = [];
+    if (pinnedSkill) {
+      goal = 'Use skill ' + pinnedSkill + '.\n\n' + goal;
+      attach.push('skill ' + pinnedSkill);
+    }
+    if (pendingImage) {
+      goal += '\n\nIMAGE TO ATTACH: ' + pendingImage.rel
+        + '\nUpload this image with the ATTACH protocol before other work.';
+      attach.push('ảnh ' + pendingImage.rel);
+    }
     addBlock({ type: 'user', text: raw });
+    if (attach.length) addBlock({ type: 'info', text: 'Đã gắn: ' + attach.join(' · ') });
     setHistory((prev) => [...prev, raw].slice(-100));
     setHistIdx(-1);
     draftRef.current = '';
-    runAgent({ goal: raw.trim() });
-  }, [addBlock, handleCommand, runAgent, setInputAt]);
+    setPinnedSkill('');
+    setPendingImage(null);
+    runAgent({ goal });
+  }, [addBlock, handleCommand, pendingImage, pinnedSkill, runAgent, setInputAt]);
 
   useInput((ch, key) => {
     // Approval answers have priority while a decision is pending.
