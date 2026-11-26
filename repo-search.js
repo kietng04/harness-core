@@ -8,6 +8,8 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { spawn, spawnSync } = require('child_process');
+const ignore = require('./ignore');
 
 const VERSION = 1;
 const CACHE_DIR = ['.harness', 'index'];
@@ -155,6 +157,7 @@ function chunkFile(rel, text) {
 
 function walk(root, scope, depthLimit = 12) {
   root = canonicalRoot(root);
+  const matcher = ignore.createIgnoreMatcher(root);
   const files = [];
   const seen = new Set();
   const scopeList = Array.isArray(scope) && scope.length ? scope : ['.'];
@@ -169,6 +172,7 @@ function walk(root, scope, depthLimit = 12) {
   }
   const visit = (dir, depth) => {
     if (depth > depthLimit || files.length >= 5000) return;
+    matcher.loadDir(dir);
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     entries.sort((a, b) => a.name.localeCompare(b.name));
@@ -177,13 +181,17 @@ function walk(root, scope, depthLimit = 12) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         if (SKIP_DIRS.has(entry.name)) continue;
+        const relDir = toPosix(path.relative(root, full));
+        if (!matcher.hasNegations() && matcher.ignores(relDir, true)) continue;
         visit(full, depth + 1);
       } else if (entry.isFile()) {
         const rel = toPosix(path.relative(root, full));
-        if (SKIP_RE.test(rel)) continue;
+        if (SKIP_RE.test(rel) || matcher.ignores(rel, false)) continue;
         let real;
         try { real = fs.realpathSync(full); } catch { continue; }
         if (!isInside(root, real)) continue;
+        const realRel = toPosix(path.relative(root, real));
+        if (SKIP_RE.test(realRel) || matcher.ignores(realRel, false)) continue;
         const ext = path.extname(entry.name).toLowerCase();
         if (ext && !TEXT_EXT.has(ext) && entry.name !== 'Makefile' && entry.name !== 'Dockerfile') continue;
         const key = rel;
@@ -198,7 +206,7 @@ function walk(root, scope, depthLimit = 12) {
       const st = fs.statSync(r);
       if (st.isFile()) {
         const rel = toPosix(path.relative(root, r));
-        if (!SKIP_RE.test(rel) && isInside(root, r)) files.push({ rel, abs: r });
+        if (!SKIP_RE.test(rel) && !matcher.ignores(rel, false) && isInside(root, r)) files.push({ rel, abs: r });
       } else {
         visit(r, 0);
       }
@@ -348,10 +356,369 @@ function dedupe(hits) {
   return out;
 }
 
+function patternLimit(args) {
+  return Math.max(1, Math.min(20, Number(args.limit) || 5));
+}
+
+function rgAvailable() {
+  if (rgAvailable.cached != null) return rgAvailable.cached;
+  try {
+    const r = spawnSync('rg', ['--version'], { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] });
+    rgAvailable.cached = r.status === 0;
+  } catch {
+    rgAvailable.cached = false;
+  }
+  return rgAvailable.cached;
+}
+
+function makeMatcher(args) {
+  const query = String(args.query || '');
+  const caseSensitive = args.caseSensitive === true;
+  if (args.match === 'regex') {
+    let re;
+    try {
+      re = new RegExp(query, caseSensitive ? '' : 'i');
+    } catch (e) {
+      return { error: 'invalid regex: ' + e.message };
+    }
+    return {
+      test: (line) => re.test(line),
+      flags: caseSensitive ? [] : ['-i'],
+      rg: ['-e', query],
+    };
+  }
+  return {
+    test: (line) => caseSensitive ? line.includes(query) : line.toLowerCase().includes(query.toLowerCase()),
+    flags: caseSensitive ? [] : ['-i'],
+    rg: ['-F', '-e', query],
+  };
+}
+
+function hitFromLine(rel, lines, index, matchIndex, column, reason) {
+  const from = Math.max(0, index - 1);
+  const snippet = lines.slice(from, Math.min(lines.length, index + 2)).join('\n');
+  return {
+    path: rel,
+    from: index + 1,
+    to: index + 1,
+    line: index + 1,
+    column: column + 1,
+    symbol: '',
+    score: 10,
+    reason,
+    snippet,
+    matchIndex,
+  };
+}
+
+function nodePatternScan(root, args, allowed, signal) {
+  const matcher = makeMatcher(args);
+  if (matcher.error) return { ok: false, code: 'invalid_args', error: matcher.error };
+  const limit = patternLimit(args);
+  const hits = [];
+  let scanned = 0;
+  let truncated = false;
+  for (const rel of allowed) {
+    if (signal && signal.aborted) return { ok: false, code: 'cancelled', error: 'cancelled' };
+    let text;
+    try { text = readText(path.join(root, rel)); } catch { continue; }
+    if (text == null) continue;
+    scanned++;
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      let idx = -1;
+      if (args.match === 'regex') {
+        const m = line.match(matcher.re);
+        idx = m ? m.index : -1;
+      } else {
+        idx = matcher.caseSensitive === true ? line.indexOf(args.query) : line.toLowerCase().indexOf(String(args.query).toLowerCase());
+      }
+      if (idx < 0) continue;
+      hits.push(hitFromLine(rel, lines, i, idx, idx, args.match === 'regex' ? 'regex match' : 'literal match'));
+      if (hits.length > limit) { truncated = true; break; }
+    }
+    if (hits.length > limit) break;
+  }
+  return {
+    ok: true,
+    data: {
+      query: String(args.query),
+      match: args.match,
+      backend: 'node',
+      hits: hydrateHits(root, hits.slice(0, limit), args),
+      truncated: truncated || hits.length > limit,
+      scanned,
+    },
+  };
+}
+
+function parseRgOutput(stdout, allowed, limit) {
+  const hits = [];
+  let truncated = false;
+  for (const raw of String(stdout || '').split('\n')) {
+    if (!raw) continue;
+    let m = raw.match(/^(.*?):(\d+):(\d+):(.*)$/);
+    let rel;
+    let line;
+    let col;
+    if (m) {
+      rel = m[1]; line = Number(m[2]); col = Number(m[3]);
+    } else {
+      m = raw.match(/^(.*?):(\d+):(.*)$/);
+      if (!m) continue;
+      rel = m[1]; line = Number(m[2]); col = 1;
+    }
+    rel = rel.replace(/^\.\//, '').split(path.sep).join('/');
+    if (!allowed.has(rel)) continue;
+    hits.push({ path: rel, from: line, to: line, line, column: col, symbol: '', score: 10, snippet: '', reason: 'pattern match', matchIndex: 0 });
+    if (hits.length > limit) { truncated = true; break; }
+  }
+  return { hits: hits.slice(0, limit), truncated };
+}
+
+function hydrateHits(root, hits, args) {
+  const cache = new Map();
+  for (const hit of hits) {
+    let lines = cache.get(hit.path);
+    if (!lines) {
+      let text = '';
+      try { text = readText(path.join(root, hit.path)) || ''; } catch {}
+      lines = text.split('\n');
+      cache.set(hit.path, lines);
+    }
+    const idx = hit.line - 1;
+    const line = lines[idx] || '';
+    const from = Math.max(0, idx - 1);
+    hit.snippet = lines.slice(from, Math.min(lines.length, idx + 2)).join('\n').slice(0, 1200);
+    hit.matchText = line.trim().slice(0, 300);
+    let count = 0;
+    if (args.match === 'regex') {
+      try {
+        const re = new RegExp(args.query, 'g' + (args.caseSensitive === true ? '' : 'i'));
+        count = [...line.matchAll(re)].length;
+      } catch {}
+    } else {
+      const hay = args.caseSensitive === true ? line : line.toLowerCase();
+      const needle = args.caseSensitive === true ? args.query : String(args.query).toLowerCase();
+      let at = 0;
+      while (needle && (at = hay.indexOf(needle, at)) >= 0) { count++; at += Math.max(1, needle.length); }
+    }
+    hit.matchCount = count || 1;
+  }
+  return hits;
+}
+
+function searchPatternSync(root, args) {
+  const allowedFiles = walk(root, args.scope || ['.']);
+  const allowed = new Set(allowedFiles.map((f) => f.rel));
+  if (args.backend === 'node' || !rgAvailable()) {
+    return nodePatternScan(root, args, allowed, null);
+  }
+  const matcher = makeMatcher(args);
+  if (matcher.error) return { ok: false, code: 'invalid_args', error: matcher.error };
+  const limit = patternLimit(args);
+  const rgArgs = ['-n', '--column', '--no-heading', '--color', 'never', '--no-messages', ...matcher.flags, ...matcher.rg, '.'];
+  const started = Date.now();
+  const r = spawnSync('rg', rgArgs, {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: Math.max(1000, Number(args.timeoutMs) || 10000),
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  if (r.error && r.error.code === 'ENOENT') {
+    return nodePatternScan(root, args, allowed, null);
+  }
+  if (r.error && r.error.code === 'ETIMEDOUT') {
+    return { ok: false, code: 'timeout', error: 'search timed out' };
+  }
+  if (r.status != null && ![0, 1].includes(r.status)) {
+    return { ok: false, code: 'tool_error', error: 'rg failed: ' + String(r.stderr || '').slice(0, 500) };
+  }
+  const parsed = parseRgOutput(r.stdout, allowed, limit);
+  return {
+    ok: true,
+    data: {
+      query: String(args.query),
+      match: args.match,
+      backend: 'rg',
+      hits: hydrateHits(root, parsed.hits, args),
+      truncated: parsed.truncated,
+      scanned: allowed.size,
+      durationMs: Date.now() - started,
+    },
+  };
+}
+
+async function searchPatternAsync(root, args, opts = {}) {
+  const allowedFiles = walk(root, args.scope || ['.']);
+  const allowed = new Set(allowedFiles.map((f) => f.rel));
+  if (args.backend === 'node' || !rgAvailable()) {
+    return nodePatternScan(root, args, allowed, opts.signal);
+  }
+  const matcher = makeMatcher(args);
+  if (matcher.error) return { ok: false, code: 'invalid_args', error: matcher.error };
+  const limit = patternLimit(args);
+  const rgArgs = ['-n', '--column', '--no-heading', '--color', 'never', '--no-messages', ...matcher.flags, ...matcher.rg, '.'];
+  return await new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      resolve(value);
+    };
+    let child;
+    try {
+      child = spawn('rg', rgArgs, {
+        cwd: root,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        signal: opts.signal,
+      });
+    } catch (e) {
+      finish(nodePatternScan(root, args, allowed, opts.signal));
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch {}
+      finish({ ok: false, code: 'timeout', error: 'search timed out' });
+    }, Math.max(1000, Number(opts.timeoutMs || args.timeoutMs) || 10000));
+    const onAbort = () => {
+      try { child.kill('SIGKILL'); } catch {}
+      finish({ ok: false, code: 'cancelled', error: 'cancelled' });
+    };
+    if (opts.signal) {
+      if (opts.signal.aborted) onAbort();
+      else opts.signal.addEventListener('abort', onAbort, { once: true });
+    }
+    child.stdout.on('data', (b) => { stdout += b.toString('utf8'); if (stdout.length > 8 * 1024 * 1024) { try { child.kill('SIGKILL'); } catch {} } });
+    child.stderr.on('data', (b) => { stderr += b.toString('utf8'); });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      if (opts.signal && opts.signal.aborted) finish({ ok: false, code: 'cancelled', error: 'cancelled' });
+      else finish(nodePatternScan(root, args, allowed, opts.signal));
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (opts.signal && opts.signal.aborted) {
+        finish({ ok: false, code: 'cancelled', error: 'cancelled' });
+        return;
+      }
+      if (code != null && ![0, 1].includes(code)) {
+        finish({ ok: false, code: 'tool_error', error: 'rg failed: ' + stderr.slice(0, 500) });
+        return;
+      }
+      const parsed = parseRgOutput(stdout, allowed, limit);
+      finish({
+        ok: true,
+        data: {
+          query: String(args.query),
+          match: args.match,
+          backend: 'rg',
+          hits: hydrateHits(root, parsed.hits, args),
+          truncated: parsed.truncated,
+          scanned: allowed.size,
+        },
+      });
+    });
+  });
+}
+
+async function searchPatternGroupAsync(root, args, opts = {}) {
+  root = canonicalRoot(root);
+  const queries = Array.isArray(args.queries) ? args.queries.filter((q) => q && q.query) : [];
+  if (!queries.length) return { ok: true, data: { groups: {}, scans: 0, backend: 'none' } };
+  const allowedFiles = walk(root, args.scope || ['.']);
+  const allowed = new Set(allowedFiles.map((f) => f.rel));
+  const limit = Math.max(1, Math.min(20, Number(args.limit) || 5));
+  const caseSensitive = args.caseSensitive === true;
+  const groups = {};
+  for (const q of queries) groups[q.id] = { hits: [], truncated: false };
+  let backend = 'node';
+  let scanned = 0;
+
+  const assign = (rel, lineNo, col, line) => {
+    const hay = caseSensitive ? line : line.toLowerCase();
+    const lines = line;
+    for (const q of queries) {
+      const needle = caseSensitive ? q.query : String(q.query).toLowerCase();
+      if (!hay.includes(needle)) continue;
+      if (groups[q.id].hits.length >= limit) {
+        groups[q.id].truncated = true;
+        continue;
+      }
+      groups[q.id].hits.push({
+        path: rel, from: lineNo, to: lineNo, line: lineNo, column: col + 1,
+        symbol: '', score: 10, reason: 'literal match (grouped)', snippet: lines.trim().slice(0, 1200),
+        matchText: line.trim().slice(0, 300), matchCount: 1,
+      });
+    }
+  };
+
+  if (args.backend !== 'node' && rgAvailable()) {
+    backend = 'rg';
+    const rgArgs = ['-n', '--column', '--no-heading', '--color', 'never', '--no-messages', '-F'];
+    if (!caseSensitive) rgArgs.push('-i');
+    for (const q of queries) rgArgs.push('-e', String(q.query));
+    rgArgs.push('.');
+    const stdout = await new Promise((resolve, reject) => {
+      let out = '';
+      let child;
+      try {
+        child = spawn('rg', rgArgs, { cwd: root, stdio: ['ignore', 'pipe', 'ignore'], signal: opts.signal });
+      } catch (e) {
+        reject(e);
+        return;
+      }
+      const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} reject(new Error('timeout')); }, Math.max(1000, Number(opts.timeoutMs) || 10000));
+      child.stdout.on('data', (b) => { out += b.toString('utf8'); });
+      child.on('error', (e) => { clearTimeout(timer); reject(e); });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code != null && ![0, 1].includes(code)) reject(new Error('rg failed'));
+        else resolve(out);
+      });
+    }).catch(() => null);
+    if (stdout != null) {
+      for (const raw of stdout.split('\n')) {
+        if (!raw) continue;
+        let m = raw.match(/^(.*?):(\d+):(\d+):(.*)$/);
+        let rel, lineNo, col, line;
+        if (m) { rel = m[1]; lineNo = Number(m[2]); col = Number(m[3]); line = m[4]; }
+        else {
+          m = raw.match(/^(.*?):(\d+):(.*)$/);
+          if (!m) continue;
+          rel = m[1]; lineNo = Number(m[2]); col = 1; line = m[3];
+        }
+        rel = rel.replace(/^\.\//, '').split(path.sep).join('/');
+        if (!allowed.has(rel)) continue;
+        assign(rel, lineNo, col, line);
+      }
+      scanned = allowed.size;
+      return { ok: true, data: { groups, scans: 1, backend, scanned } };
+    }
+  }
+
+  for (const rel of allowed) {
+    if (opts.signal && opts.signal.aborted) return { ok: false, code: 'cancelled', error: 'cancelled' };
+    let text = '';
+    try { text = readText(path.join(root, rel)) || ''; } catch {}
+    if (!text) continue;
+    scanned++;
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) assign(rel, i + 1, 1, lines[i]);
+  }
+  return { ok: true, data: { groups, scans: 1, backend, scanned } };
+}
+
 function search(root, args = {}) {
   root = canonicalRoot(root);
   const query = String(args.query || '').trim().slice(0, 500);
   if (!query) return { ok: false, code: 'invalid_args', error: 'query is required' };
+  if (args.match === 'literal' || args.match === 'regex') {
+    return searchPatternSync(root, { ...args, query });
+  }
   const strategy = ['auto', 'lexical', 'hybrid'].includes(args.strategy) ? args.strategy : 'auto';
   const limit = Math.max(1, Math.min(10, Number(args.limit) || 5));
   const scope = Array.isArray(args.scope) ? args.scope : (args.scope ? [args.scope] : ['.']);
@@ -397,6 +764,11 @@ function read(root, args = {}) {
   let real;
   try { real = fs.realpathSync(abs); } catch { return { ok: false, code: 'not_found', error: 'file not found' }; }
   if (!isInside(root, real)) return { ok: false, code: 'out_of_scope', error: 'symlink escapes workspace' };
+  const realRel = toPosix(path.relative(root, real));
+  const matcher = ignore.createIgnoreMatcher(root);
+  if (SKIP_RE.test(realRel) || matcher.isCursorIgnored(realRel, false)) {
+    return { ok: false, code: 'policy_denied', error: 'blocked by .cursorignore / secret filter: ' + realRel };
+  }
   const text = readText(real);
   if (text == null) return { ok: false, code: 'tool_error', error: 'not a readable text file' };
   const digest = 'sha256:' + sha256(text);
@@ -439,6 +811,8 @@ module.exports = {
   splitCamel,
   sha256,
   search,
+  searchPatternAsync,
+  searchPatternGroupAsync,
   read,
   list,
   walk,

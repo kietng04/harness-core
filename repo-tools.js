@@ -9,7 +9,10 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 const search = require('./repo-search');
+const ignore = require('./ignore');
+const hierarchy = require('./call-hierarchy');
 
 function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
@@ -229,53 +232,143 @@ function testRepo(workspace, args = {}) {
   return { ok: false, code: 'policy_unavailable', error: 'test recipe runner is not configured for this backend' };
 }
 
-function validateChanges(workspace, changes) {
+function nearestExistingDir(root, abs) {
+  let cur = path.dirname(abs);
+  while (true) {
+    if (fs.existsSync(cur)) return cur;
+    const parent = path.dirname(cur);
+    if (parent === cur || !isInside(root, parent)) return root;
+    cur = parent;
+  }
+}
+
+function validateChanges(workspace, changes, opts = {}) {
   if (!Array.isArray(changes) || !changes.length) {
     return { ok: false, code: 'invalid_args', error: 'changes[] is required' };
   }
   if (changes.length > 20) return { ok: false, code: 'invalid_args', error: 'max 20 changes' };
-  const prepared = [];
+  const matcher = ignore.createIgnoreMatcher(workspace);
+  const planMode = opts.mode === 'plan' || opts.planMode === true;
+  const knownDigests = opts.knownDigests || null;
+
+  // Group by file first. Multiple edits in one request share one base image
+  // and produce one before/after journal pair, as the plan requires.
+  const groups = new Map();
   for (const change of changes) {
     const rel = String(change.path || '').replace(/^\.\//, '');
+    if (!groups.has(rel)) groups.set(rel, []);
+    groups.get(rel).push(change);
+  }
+
+  const prepared = [];
+  for (const [rel, fileChanges] of groups) {
     const abs = insidePath(workspace, rel);
     if (!abs) return { ok: false, code: 'out_of_scope', error: 'path outside workspace: ' + rel };
-    if (/(^|\/)(\.git|\.harness|node_modules)(\/|$)/.test(toPosix(rel))) {
+    if (ignore.isProtectedPath(rel, { planMode }) || matcher.isCursorIgnored(rel)) {
       return { ok: false, code: 'out_of_scope', error: 'refusing protected path: ' + rel };
     }
+    if (planMode && !ignore.isPlanWritablePath(rel)) {
+      return { ok: false, code: 'policy_denied', error: 'plan mode forbids editing ' + rel + ' (only plan markdown files)' };
+    }
+    const exists = fs.existsSync(abs);
+    if (exists) {
+      let real;
+      try { real = fs.realpathSync(abs); } catch { real = abs; }
+      if (!isInside(workspace, real)) {
+        return { ok: false, code: 'out_of_scope', error: 'symlink escapes workspace: ' + rel };
+      }
+      const realRel = toPosix(path.relative(workspace, real));
+      if (ignore.isProtectedPath(realRel, { planMode }) || matcher.isCursorIgnored(realRel)) {
+        return { ok: false, code: 'out_of_scope', error: 'refusing protected symlink target: ' + realRel };
+      }
+    } else {
+      let realParent;
+      try { realParent = fs.realpathSync(nearestExistingDir(workspace, abs)); } catch { realParent = workspace; }
+      if (!isInside(workspace, realParent)) {
+        return { ok: false, code: 'out_of_scope', error: 'parent symlink escapes workspace: ' + rel };
+      }
+    }
+
+    const create = !exists && fileChanges.some((c) => c.create === true || (planMode && ignore.isPlanWritablePath(rel) && c.find == null));
+    if (create) {
+      if (fileChanges.length > 1) {
+        return { ok: false, code: 'invalid_args', error: 'create supports one change per file: ' + rel };
+      }
+      const change = fileChanges[0];
+      const next = String(change.text == null ? (change.replace == null ? '' : change.replace) : change.text);
+      prepared.push({
+        rel, abs, created: true, before: null, after: next,
+        digest: 'sha256:new', nextDigest: 'sha256:' + sha256(next),
+      });
+      continue;
+    }
+
     let text;
     try { text = fs.readFileSync(abs, 'utf8'); } catch (e) {
       return { ok: false, code: 'not_found', error: 'cannot read ' + rel + ': ' + e.message };
     }
     const digest = 'sha256:' + sha256(text);
-    if (change.expectedDigest && String(change.expectedDigest) !== digest) {
-      return { ok: false, code: 'stale_revision', error: 'digest mismatch for ' + rel, data: { path: rel, digest } };
+    for (const change of fileChanges) {
+      const expected = change.expectedDigest || (knownDigests && knownDigests[rel]);
+      if (expected && String(expected) !== digest) {
+        return {
+          ok: false, code: 'stale_revision',
+          error: 'file changed externally since last read for ' + rel + '; re-read with repo.read before patching',
+          data: { path: rel, digest, expectedDigest: String(expected) },
+        };
+      }
     }
-    let next;
-    if (change.find != null) {
+
+    const rangeChanges = [];
+    const findChanges = [];
+    const baseLines = text.split('\n');
+    for (const change of fileChanges) {
+      if (change.find != null) {
+        findChanges.push(change);
+      } else {
+        const from = Math.max(1, Number(change.from) || 1);
+        const to = Math.min(baseLines.length, Number(change.to) || from);
+        if (to < from) return { ok: false, code: 'tool_error', error: 'invalid range for ' + rel };
+        rangeChanges.push({ from, to, text: String(change.text == null ? '' : change.text) });
+      }
+    }
+
+    rangeChanges.sort((a, b) => b.from - a.from);
+    for (let i = 1; i < rangeChanges.length; i++) {
+      if (rangeChanges[i].to >= rangeChanges[i - 1].from) {
+        return { ok: false, code: 'tool_error', error: 'overlapping range edits in ' + rel };
+      }
+    }
+    let current = text;
+    for (const range of rangeChanges) {
+      const lines = current.split('\n');
+      const replacement = range.text.split('\n');
+      current = [...lines.slice(0, range.from - 1), ...replacement, ...lines.slice(range.to)].join('\n');
+    }
+
+    for (const change of findChanges) {
       const find = String(change.find);
       const replace = String(change.replace == null ? '' : change.replace);
-      const count = text.split(find).length - 1;
+      const count = current.split(find).length - 1;
       if (!count) return { ok: false, code: 'tool_error', error: 'find text not found in ' + rel };
       if (count > 1 && change.all !== true) {
         return { ok: false, code: 'tool_error', error: 'find text is ambiguous in ' + rel + ' (' + count + ' matches)' };
       }
-      next = change.all === true ? text.split(find).join(replace) : text.replace(find, replace);
-    } else {
-      const lines = text.split('\n');
-      const from = Math.max(1, Number(change.from) || 1);
-      const to = Math.min(lines.length, Number(change.to) || from);
-      if (to < from) return { ok: false, code: 'tool_error', error: 'invalid range for ' + rel };
-      const replacement = String(change.text == null ? '' : change.text).split('\n');
-      next = [...lines.slice(0, from - 1), ...replacement, ...lines.slice(to)].join('\n');
+      if (change.all === true) current = current.split(find).join(replace);
+      else current = current.replace(find, () => replace);
     }
-    prepared.push({ rel, abs, before: text, after: next, digest, nextDigest: 'sha256:' + sha256(next) });
+
+    prepared.push({
+      rel, abs, created: false, before: text, after: current,
+      digest, nextDigest: 'sha256:' + sha256(current),
+    });
   }
   return { ok: true, prepared };
 }
 
-function applyPatch(workspace, args = {}, actionId) {
+function applyPatch(workspace, args = {}, actionId, opts = {}) {
   workspace = canonicalRoot(workspace);
-  const checked = validateChanges(workspace, args.changes);
+  const checked = validateChanges(workspace, args.changes, opts);
   if (!checked.ok) return checked;
   const journalDir = path.join(workspace, '.harness', 'journal');
   fs.mkdirSync(journalDir, { recursive: true });
@@ -287,6 +380,7 @@ function applyPatch(workspace, args = {}, actionId) {
     workspace,
     changes: checked.prepared.map((p) => ({
       path: p.rel,
+      created: !!p.created,
       beforeDigest: p.digest,
       afterDigest: p.nextDigest,
       beforeText: p.before,
@@ -298,11 +392,16 @@ function applyPatch(workspace, args = {}, actionId) {
   const written = [];
   try {
     for (const item of checked.prepared) {
-      const st = fs.statSync(item.abs);
+      let fileMode = 0o644;
+      if (!item.created) {
+        fileMode = fs.statSync(item.abs).mode;
+      } else {
+        fs.mkdirSync(path.dirname(item.abs), { recursive: true });
+      }
       const tmp = item.abs + '.harness-tmp-' + process.pid;
-      fs.writeFileSync(tmp, item.after, { mode: st.mode });
+      fs.writeFileSync(tmp, item.after, { mode: fileMode });
       fs.renameSync(tmp, item.abs);
-      written.push({ path: item.rel, beforeDigest: item.digest, afterDigest: item.nextDigest });
+      written.push({ path: item.rel, created: !!item.created, beforeDigest: item.digest, afterDigest: item.nextDigest });
     }
     journal.status = 'applied';
     journal.written = written;
@@ -359,12 +458,16 @@ function rollback(workspace, args = {}, actionId) {
     if (digest !== change.afterDigest) {
       return { ok: false, code: 'stale_revision', error: 'current file changed since patch: ' + change.path, data: { digest } };
     }
-    if (typeof change.beforeText !== 'string') {
+    if (!change.created && typeof change.beforeText !== 'string') {
       return { ok: false, code: 'tool_error', error: 'journal has no beforeText for ' + change.path };
     }
-    prepared.push({ abs, rel: change.path, beforeText: change.beforeText });
+    prepared.push({ abs, rel: change.path, created: !!change.created, beforeText: change.beforeText });
   }
   for (const item of prepared) {
+    if (item.created) {
+      fs.rmSync(item.abs, { force: true });
+      continue;
+    }
     const tmp = item.abs + '.harness-rollback-' + process.pid;
     const st = fs.statSync(item.abs);
     fs.writeFileSync(tmp, item.beforeText, { mode: st.mode });
@@ -385,10 +488,182 @@ function rollback(workspace, args = {}, actionId) {
   return { ok: true, data: { journal: toPosix(path.relative(workspace, outFile)), files: out.files } };
 }
 
-function runBatch(workspace, args = {}) {
+const SCHEMA_HINTS = {
+  'repo.search': '{"query": string, "scope"?: string[], "match"?: "auto"|"literal"|"regex"|"hybrid", "limit"?: number}',
+  'repo.read': '{"path": string, "from"?: number, "to"?: number, "expectedDigest"?: string}',
+  'repo.list': '{"scope"?: string[], "depth"?: number, "limit"?: number}',
+  'repo.map': '{"scope"?: string[], "limit"?: number}',
+  'repo.symbol': '{"name": string, "scope"?: string[]}',
+  'repo.references': '{"name": string, "scope"?: string[]}',
+  'repo.graph': '{"scope"?: string[], "path"?: string}',
+  'repo.impact': '{"path"?: string, "paths"?: string[], "scope"?: string[], "depth"?: number}',
+  'repo.tests': '{"path"?: string, "paths"?: string[], "scope"?: string[]}',
+  'repo.locate': '{"query"?: string, "symbol"?: string, "path"?: string, "line"?: number, "column"?: number, "scope"?: string[], "hierarchy"?: boolean}',
+  'repo.diff': '{"path"?: string, "paths"?: string[], "staged"?: boolean, "base"?: string, "statOnly"?: boolean, "maxBytes"?: number}',
+  'repo.apply_patch': '{"changes": [{"path": string, "find"?: string, "replace"?: string, "from"?: number, "to"?: number, "text"?: string, "create"?: boolean, "expectedDigest"?: string}]}',
+  'repo.rollback': '{"journal": string}',
+  'tool.batch': '{"actions": [{"id"?: string, "tool": string, "args"?: object}]}',
+  'skill.load': '{"name": string}',
+};
+
+function attachSchemaHint(tool, res) {
+  if (res && !res.ok && res.code === 'invalid_args' && SCHEMA_HINTS[tool] && !res.schema) {
+    return { ...res, schema: SCHEMA_HINTS[tool] };
+  }
+  return res;
+}
+
+/**
+ * Read-only structured git diff for workspace files, respecting .cursorignore
+ * and secret filters.
+ */
+function diffRepo(workspace, args = {}) {
+  workspace = canonicalRoot(workspace);
+  const matcher = ignore.createIgnoreMatcher(workspace);
+  const reqPaths = Array.isArray(args.paths) ? args.paths.map(String) : (args.path ? [String(args.path)] : []);
+  for (const p of reqPaths) {
+    const rel = String(p || '').replace(/^\.\//, '');
+    const abs = insidePath(workspace, rel);
+    if (!abs) return { ok: false, code: 'out_of_scope', error: 'path outside workspace: ' + rel };
+    if (matcher.isCursorIgnored(rel)) return { ok: false, code: 'policy_denied', error: 'blocked by .cursorignore: ' + rel };
+  }
+  const base = args.base ? String(args.base).trim() : '';
+  if (base && (base.startsWith('-') || !/^[A-Za-z0-9._\/~^@:]+$/.test(base))) {
+    return { ok: false, code: 'invalid_args', error: 'invalid git base ref' };
+  }
+  const maxBytes = Math.max(1000, Math.min(48000, Number(args.maxBytes) || 24000));
+  const execGit = (gitArgs) => execFileSync('git', gitArgs, {
+    cwd: workspace, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 8000,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+  });
+
+  try {
+    execGit(['rev-parse', '--is-inside-work-tree']);
+  } catch {
+    return { ok: false, code: 'tool_error', error: 'workspace is not a git repository' };
+  }
+
+  const baseArgs = ['diff', '--no-color'];
+  if (args.staged) baseArgs.push('--staged');
+  if (base) baseArgs.push(base);
+  const statArgs = [...baseArgs, '--stat', ...(reqPaths.length ? ['--', ...reqPaths] : [])];
+  const nameArgs = [...baseArgs, '--name-only', ...(reqPaths.length ? ['--', ...reqPaths] : [])];
+
+  let stat = '';
+  let files = [];
+  try {
+    stat = execGit(statArgs).trim();
+    files = execGit(nameArgs).split('\n').map((s) => s.trim()).filter(Boolean);
+  } catch (e) {
+    return { ok: false, code: 'tool_error', error: 'git diff failed: ' + (e.message || e) };
+  }
+
+  const safeFiles = files.filter((f) => !matcher.isCursorIgnored(f) && !/(^|\/)(\.env|\.env\..*|.*\.pem|.*\.key)$/i.test(f));
+  if (args.statOnly) {
+    return { ok: true, data: { files: safeFiles, stat, diff: '', truncated: false, base: base || (args.staged ? 'STAGED' : 'WORKTREE') } };
+  }
+
+  let diff = '';
+  if (safeFiles.length) {
+    try {
+      diff = execGit([...baseArgs, '--', ...safeFiles]);
+    } catch (e) {
+      return { ok: false, code: 'tool_error', error: 'git diff failed: ' + (e.message || e) };
+    }
+  }
+  const truncated = Buffer.byteLength(diff) > maxBytes;
+  if (truncated) diff = diff.slice(0, maxBytes) + '\n... (diff truncated)';
+  return {
+    ok: true,
+    data: {
+      files: safeFiles,
+      stat,
+      diff,
+      truncated,
+      base: base || (args.staged ? 'STAGED' : 'WORKTREE'),
+    },
+  };
+}
+
+function locateRepo(workspace, args = {}) {
+  const query = String(args.query || args.symbol || '').trim();
+  if (!query && !args.path) return { ok: false, code: 'invalid_args', error: 'query, symbol or path:line is required' };
+  const scope = args.scope || ['.'];
+  const found = query ? search.search(workspace, {
+    query,
+    scope,
+    strategy: 'auto',
+    limit: Math.max(1, Math.min(5, Number(args.limit) || 5)),
+  }) : { ok: true, data: { hits: [], strategy: 'none' } };
+  if (!found.ok) return found;
+  const definitions = [];
+  for (const hit of (found.data.hits || []).slice(0, 3)) {
+    const read = search.read(workspace, {
+      path: hit.path,
+      from: Math.max(1, hit.from - 2),
+      to: hit.to + 8,
+    });
+    definitions.push({
+      path: hit.path,
+      from: hit.from,
+      to: hit.to,
+      symbol: hit.symbol || '',
+      reason: hit.reason,
+      snippet: hit.snippet,
+      digest: read.ok ? read.data.digest : null,
+      text: read.ok ? read.data.text : '',
+      truncated: read.ok ? read.data.truncated : false,
+    });
+  }
+  let hierarchyData = null;
+  if (args.hierarchy !== false && (args.symbol || args.path || query)) {
+    hierarchyData = hierarchy.callHierarchy(workspace, {
+      symbol: args.symbol || query,
+      path: args.path,
+      line: args.line,
+      column: args.column,
+      scope,
+      limit: args.hierarchyLimit,
+    });
+    if (hierarchyData.ok && !definitions.length) {
+      for (const def of hierarchyData.data.definitions || []) {
+        const read = search.read(workspace, { path: def.path, from: Math.max(1, def.line - 2), to: def.line + 8 });
+        definitions.push({
+          path: def.path, from: def.line, to: def.line, symbol: def.symbol || hierarchyData.data.symbol,
+          reason: 'symbol definition', snippet: read.ok ? read.data.text : def.text,
+          digest: def.digest, text: read.ok ? read.data.text : '', truncated: false,
+        });
+      }
+    }
+  }
+  const paths = [...new Set(definitions.map((d) => d.path))];
+  const impact = paths.length ? impactRepo(workspace, { paths, scope: ['.'] }) : { ok: true, data: { affected: [] } };
+  const tests = paths.length ? testsRepo(workspace, { paths, scope: ['.'] }) : { ok: true, data: { suggestions: [] } };
+  return {
+    ok: true,
+    data: {
+      query: query || hierarchyData?.data?.symbol || '',
+      strategy: found.data.strategy,
+      target: hierarchyData && hierarchyData.ok ? hierarchyData.data.target : null,
+      definitions,
+      affected: impact.ok ? impact.data.affected.slice(0, 10) : [],
+      tests: tests.ok ? tests.data.suggestions.slice(0, 5) : [],
+      callers: hierarchyData && hierarchyData.ok ? hierarchyData.data.callers : [],
+      callees: hierarchyData && hierarchyData.ok ? hierarchyData.data.callees : [],
+      unresolved: hierarchyData && hierarchyData.ok ? hierarchyData.data.unresolved : [],
+      ambiguous: !!(hierarchyData && hierarchyData.ok && hierarchyData.data.ambiguous),
+      coverage: hierarchyData && hierarchyData.ok ? hierarchyData.data.coverage : null,
+      revision: hierarchyData && hierarchyData.ok ? hierarchyData.data.revision : null,
+      truncated: definitions.some((d) => d.truncated),
+      advisory: true,
+    },
+  };
+}
+
+function runBatch(workspace, args = {}, opts = {}) {
   const actions = Array.isArray(args.actions) ? args.actions.slice(0, 3) : [];
   if (!actions.length) return { ok: false, code: 'invalid_args', error: 'actions[] is required (max 3)' };
-  const allowed = new Set(['repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol', 'repo.references', 'repo.graph', 'repo.impact', 'repo.tests']);
+  const allowed = new Set(['repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol', 'repo.references', 'repo.graph', 'repo.impact', 'repo.tests', 'repo.diff', 'repo.locate']);
   const results = [];
   let bytes = 0;
   for (const action of actions) {
@@ -410,32 +685,208 @@ function runBatch(workspace, args = {}) {
 }
 
 function runTool(workspace, name, args = {}, opts = {}) {
+  let res;
   switch (name) {
-    case 'repo.search': return search.search(workspace, args);
-    case 'repo.read': return search.read(workspace, args);
-    case 'repo.list': return search.list(workspace, args);
-    case 'repo.map': return mapRepo(workspace, args);
-    case 'repo.symbol': return symbolRepo(workspace, args);
-    case 'repo.references': return referencesRepo(workspace, args);
-    case 'repo.graph': return graphRepo(workspace, args);
-    case 'repo.impact': return impactRepo(workspace, args);
-    case 'repo.tests': return testsRepo(workspace, args);
-    case 'workspace.diagnostics': return diagnosticsRepo(workspace, args);
-    case 'workspace.test': return testRepo(workspace, args);
+    case 'repo.search': res = search.search(workspace, args); break;
+    case 'repo.read': res = search.read(workspace, args); break;
+    case 'repo.list': res = search.list(workspace, args); break;
+    case 'repo.map': res = mapRepo(workspace, args); break;
+    case 'repo.symbol': res = symbolRepo(workspace, args); break;
+    case 'repo.references': res = referencesRepo(workspace, args); break;
+    case 'repo.graph': res = graphRepo(workspace, args); break;
+    case 'repo.impact': res = impactRepo(workspace, args); break;
+    case 'repo.tests': res = testsRepo(workspace, args); break;
+    case 'repo.diff': res = diffRepo(workspace, args); break;
+    case 'repo.locate': res = locateRepo(workspace, args); break;
+    case 'workspace.diagnostics': res = diagnosticsRepo(workspace, args); break;
+    case 'workspace.test': res = testRepo(workspace, args); break;
     case 'repo.apply_patch':
-      if (opts.readonly) return { ok: false, code: 'policy_denied', error: 'read-only mode' };
-      return applyPatch(workspace, args, opts.actionId);
+      if (opts.readonly) res = { ok: false, code: 'policy_denied', error: 'read-only mode' };
+      else res = applyPatch(workspace, args, opts.actionId, opts);
+      break;
     case 'repo.rollback':
-      if (opts.readonly) return { ok: false, code: 'policy_denied', error: 'read-only mode' };
-      return rollback(workspace, args, opts.actionId);
-    case 'tool.batch': return runBatch(workspace, args);
+      if (opts.readonly) res = { ok: false, code: 'policy_denied', error: 'read-only mode' };
+      else res = rollback(workspace, args, opts.actionId);
+      break;
+    case 'tool.batch': res = runBatch(workspace, args, opts); break;
     default:
-      return { ok: false, code: 'invalid_args', error: 'unknown tool: ' + name };
+      res = { ok: false, code: 'invalid_args', error: 'unknown tool: ' + name };
   }
+  return attachSchemaHint(name, res);
+}
+
+async function runToolAsync(workspace, name, args = {}, opts = {}) {
+  if (name === 'tool.batch') return attachSchemaHint(name, await runBatchAsync(workspace, args, opts));
+  if (name === 'repo.search' && (args.match === 'literal' || args.match === 'regex')) {
+    return attachSchemaHint(name, await search.searchPatternAsync(workspace, args, opts));
+  }
+  if (name === 'repo.read') {
+    // Keep range/digest semantics identical; the file read itself is cheap, but
+    // yielding lets independent literal searches overlap with it.
+    await new Promise((resolve) => setImmediate(resolve));
+    if (opts.signal && opts.signal.aborted) return { ok: false, code: 'cancelled', error: 'cancelled' };
+    return attachSchemaHint(name, search.read(workspace, args));
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  if (opts.signal && opts.signal.aborted) return { ok: false, code: 'cancelled', error: 'cancelled' };
+  return runTool(workspace, name, args, opts);
+}
+
+function leafStatus(result) {
+  if (!result || result.ok === false) {
+    if (result && result.code === 'cancelled') return 'cancelled';
+    if (result && result.code === 'timeout') return 'timeout';
+    return 'error';
+  }
+  const data = result.data || {};
+  if (data.truncated) return 'truncated';
+  if (Array.isArray(data.hits) && data.hits.length === 0) return 'no_hits';
+  if (Array.isArray(data.results) && data.results.every((r) => r.status === 'no_hits')) return 'no_hits';
+  return 'ok';
+}
+
+function normalizeBatchAction(action, index) {
+  return {
+    id: action && action.id != null ? String(action.id) : String(index + 1),
+    tool: String(action && action.tool || ''),
+    args: (action && action.args && typeof action.args === 'object' && !Array.isArray(action.args))
+      ? action.args : {},
+  };
+}
+
+async function runBatchAsync(workspace, args = {}, opts = {}) {
+  const raw = Array.isArray(args.actions) ? args.actions : [];
+  if (!raw.length) return { ok: false, code: 'invalid_args', error: 'actions[] is required (max 3)' };
+  const skipped = Math.max(0, raw.length - 3);
+  const actions = raw.slice(0, 3).map(normalizeBatchAction);
+  const allowed = new Set([
+    'repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol',
+    'repo.references', 'repo.graph', 'repo.impact', 'repo.tests', 'repo.diff', 'repo.locate',
+  ]);
+  const started = Date.now();
+  const results = new Array(actions.length);
+  let scans = 0;
+
+  const decide = (action) => {
+    if (opts.decide) return opts.decide(action.tool, action.args);
+    return { decision: 'allow', code: 'ok' };
+  };
+
+  for (let i = 0; i < actions.length; i++) {
+    const action = actions[i];
+    if (!allowed.has(action.tool)) {
+      results[i] = {
+        id: action.id, tool: action.tool, ok: false,
+        code: 'policy_denied', error: 'not allowed in batch: ' + action.tool, status: 'error',
+      };
+      continue;
+    }
+    const decision = decide(action);
+    if (decision.decision !== 'allow') {
+      results[i] = {
+        id: action.id, tool: action.tool, ok: false,
+        code: decision.code || 'policy_denied', error: decision.reason || 'denied', status: 'error',
+      };
+    }
+  }
+
+  const pending = actions.map((action, i) => ({ action, i })).filter((item) => !results[item.i]);
+  const allLiteral = pending.length > 1 && pending.every(({ action }) => (
+    action.tool === 'repo.search' && action.args.match === 'literal'
+  ));
+  const sameGroup = allLiteral && pending.every(({ action }) => (
+    JSON.stringify(action.args.scope || ['.']) === JSON.stringify(pending[0].action.args.scope || ['.'])
+    && (action.args.caseSensitive === true) === (pending[0].action.args.caseSensitive === true)
+    && (Number(action.args.limit) || 5) === (Number(pending[0].action.args.limit) || 5)
+  ));
+
+  if (sameGroup) {
+    scans = 1;
+    const grouped = await search.searchPatternGroupAsync(workspace, {
+      queries: pending.map(({ action }) => ({ id: action.id, query: action.args.query })),
+      scope: pending[0].action.args.scope || ['.'],
+      caseSensitive: pending[0].action.args.caseSensitive === true,
+      limit: Number(pending[0].action.args.limit) || 5,
+      backend: pending[0].action.args.backend,
+    }, opts);
+    for (const { action, i } of pending) {
+      if (!grouped.ok) {
+        results[i] = { id: action.id, tool: action.tool, ok: false, code: grouped.code, error: grouped.error, status: leafStatus(grouped) };
+        continue;
+      }
+      const group = grouped.data.groups[action.id] || { hits: [], truncated: false };
+      results[i] = {
+        id: action.id,
+        tool: action.tool,
+        ok: true,
+        status: group.hits.length ? (group.truncated ? 'truncated' : 'ok') : 'no_hits',
+        data: {
+          query: action.args.query,
+          match: 'literal',
+          backend: grouped.data.backend,
+          hits: group.hits,
+          truncated: group.truncated,
+          scanned: grouped.data.scanned,
+          grouped: true,
+        },
+      };
+    }
+  } else {
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < pending.length) {
+        const item = pending[cursor++];
+        if (opts.signal && opts.signal.aborted) {
+          results[item.i] = {
+            id: item.action.id, tool: item.action.tool, ok: false,
+            code: 'cancelled', error: 'cancelled', status: 'cancelled',
+          };
+          continue;
+        }
+        if (opts.deadline && Date.now() > opts.deadline) {
+          results[item.i] = {
+            id: item.action.id, tool: item.action.tool, ok: false,
+            code: 'timeout', error: 'batch deadline exceeded', status: 'timeout',
+          };
+          continue;
+        }
+        scans++;
+        let result;
+        try {
+          const exec = opts.executor || runToolAsync;
+          result = await exec(workspace, item.action.tool, item.action.args, opts);
+        } catch (e) {
+          result = { ok: false, code: 'tool_error', error: e.message };
+        }
+        results[item.i] = {
+          id: item.action.id,
+          tool: item.action.tool,
+          ok: !!result.ok,
+          status: leafStatus(result),
+          ...(result.ok ? { data: result.data } : { code: result.code || 'tool_error', error: result.error }),
+        };
+      }
+    };
+    const workers = Array.from({ length: Math.min(2, pending.length) }, () => worker());
+    await Promise.all(workers);
+  }
+
+  return {
+    ok: true,
+    data: {
+      results,
+      skipped,
+      concurrency: sameGroup ? 1 : Math.min(2, pending.length),
+      scans,
+      durationMs: Date.now() - started,
+    },
+  };
 }
 
 module.exports = {
   runTool,
+  runToolAsync,
+  runBatchAsync,
   applyPatch,
   rollback,
   mapRepo,
@@ -444,4 +895,8 @@ module.exports = {
   graphRepo,
   impactRepo,
   testsRepo,
+  locateRepo,
+  diffRepo,
+  attachSchemaHint,
+  SCHEMA_HINTS,
 };

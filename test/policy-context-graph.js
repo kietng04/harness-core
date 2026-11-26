@@ -69,6 +69,10 @@ try {
   check('impact affected controller', impact.data.affected.includes('src/controller.js'), true);
   const tests = tools.runTool(root, 'repo.tests', { path: 'src/service.js' });
   check('test suggestion', tests.data.suggestions.some((s) => s.path === 'test/service.test.js'), true);
+  const locate = tools.runTool(root, 'repo.locate', { query: 'service' });
+  check('locate definitions', locate.data.definitions.length >= 1, true);
+  check('locate affected', locate.data.affected.includes('src/controller.js'), true);
+  check('locate tests', locate.data.tests.some((s) => s.path === 'test/service.test.js'), true);
   const diagnostics = tools.runTool(root, 'workspace.diagnostics', {});
   check('diagnostics unavailable', diagnostics.code, 'policy_unavailable');
 

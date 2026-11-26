@@ -318,13 +318,26 @@ Copilot dùng typed tool qua fenced JSON:
 ```json
 {"version":1,"tool":"repo.search","args":{"query":"resume session","strategy":"auto","limit":5}}
 {"version":1,"tool":"repo.read","args":{"path":"src/a.js","from":1,"to":80}}
-{"version":1,"tool":"repo.apply_patch","args":{"changes":[{"path":"src/a.js","find":"old","replace":"new"}]}}
+{"version":1,"tool":"repo.locate","args":{"symbol":"restoreCheckpoint","scope":["src"]}}
+{"version":1,"tool":"tool.batch","args":{"actions":[
+  {"id":"def","tool":"repo.search","args":{"query":"restoreCheckpoint","match":"literal","scope":["src"]}},
+  {"id":"tests","tool":"repo.search","args":{"query":"stale_revision","match":"literal","scope":["test"]}}
+]}}
 ```
 
 Các tool: `repo.search`, `repo.read`, `repo.list`, `repo.map`, `repo.symbol`,
-`repo.references`, `repo.graph`, `repo.impact`, `repo.tests`,
-`repo.apply_patch`, `repo.rollback`, `tool.batch`, `workspace.diagnostics`,
-`workspace.test`. Patch validate digest,
+`repo.references`, `repo.graph`, `repo.impact`, `repo.tests`, `repo.diff`,
+`repo.locate`, `repo.apply_patch`, `repo.rollback`, `tool.batch`,
+`workspace.diagnostics`, `workspace.test`.
+
+`repo.search` nhận `match:"literal"|"regex"` (dùng `rg` nếu có, fallback Node)
+và `scope`, `limit`. `tool.batch` chạy tối đa 3 read action với concurrency 2,
+giữ thứ tự input, mỗi action có `id`; literal cùng scope được gom một lần scan.
+`repo.locate` trả definitions + caller/callee một hop: import alias, comment bị
+bỏ qua, call động/không resolve được đánh dấu `unresolved` với coverage và
+revision. Backend hiện là regex/import graph, không thêm compiler dependency;
+khi có LSP/tsc local có thể thay lớp `call-hierarchy.js`.
+Patch validate digest,
 ghi journal `.harness/journal/`, atomic rename; readonly/preview bị chặn; rollback
 chỉ chạy khi file hiện tại đúng after-digest.
 TUI cũng có `/search <query>` và `/index`.

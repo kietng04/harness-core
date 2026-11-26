@@ -109,6 +109,26 @@ check('rollback restored', fs.readFileSync(path.join(work, 'src', 'filter.js'), 
 const secondRollback = tools.runTool(work, 'repo.rollback', { journal: patch.data.journal }, 24);
 check('rollback stale guard', secondRollback.code, 'stale_revision');
 
+// Multiple edits in one file share one base; replacement is literal ($&).
+const multi = tools.runTool(work, 'repo.apply_patch', {
+  changes: [
+    { path: 'src/filter.js', find: 'function filterEmpty', replace: 'function filterEmpty$&' },
+    { path: 'src/filter.js', find: 'return items.filter(Boolean);', replace: 'return items.filter((x) => x != null);' },
+  ],
+}, 25);
+check('multi-edit ok', multi.ok, true);
+check('multi-edit count', multi.data.changes.length, 1);
+const multiText = fs.readFileSync(path.join(work, 'src', 'filter.js'), 'utf8');
+includes('multi-edit first literal', multiText, 'function filterEmpty$&');
+includes('multi-edit second', multiText, 'x != null');
+const overlap = tools.runTool(work, 'repo.apply_patch', {
+  changes: [
+    { path: 'src/filter.js', from: 2, to: 3, text: 'x' },
+    { path: 'src/filter.js', from: 3, to: 4, text: 'y' },
+  ],
+}, 26);
+check('overlap edit rejected', overlap.code, 'tool_error');
+
 // Batch read-only.
 const batch = tools.runTool(work, 'tool.batch', {
   actions: [
@@ -178,7 +198,7 @@ const light = spawnSync(process.execPath, [
   AGENT, '--prompt', '--workdir', work, '--', 'run pwd and echo ok',
 ], { cwd: ROOT, encoding: 'utf8', timeout: 30000 });
 check('light prompt exit', light.status, 0);
-check('light prompt bounded', Buffer.byteLength(light.stdout) < 1600, true);
+check('light prompt bounded', Buffer.byteLength(light.stdout) < 2000, true);
 check('light prompt skills once', (light.stdout.match(/AVAILABLE SKILLS/g) || []).length, 1);
 includes('light prompt tools', light.stdout, 'repo.search');
 

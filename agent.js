@@ -2675,13 +2675,13 @@ function checkPolicy(script) {
 
 const TOOL_NAMES = new Set([
   'repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol',
-  'repo.references', 'repo.graph', 'repo.impact', 'repo.tests',
+  'repo.references', 'repo.graph', 'repo.impact', 'repo.tests', 'repo.diff', 'repo.locate',
   'repo.apply_patch', 'repo.rollback', 'tool.batch',
   'workspace.diagnostics', 'workspace.test',
 ]);
 const READ_TOOLS = new Set([
   'repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol',
-  'repo.references', 'repo.graph', 'repo.impact', 'repo.tests',
+  'repo.references', 'repo.graph', 'repo.impact', 'repo.tests', 'repo.diff', 'repo.locate',
 ]);
 
 /* ------------------------------------------------------------------- exec */
@@ -2755,13 +2755,28 @@ async function executeToolAction(action, turn) {
     args: JSON.stringify(args).slice(0, 4000),
   });
   let result;
+  const abort = new AbortController();
+  const onAbort = () => { try { abort.abort(); } catch {} };
+  process.once('SIGINT', onAbort);
+  const deadline = Date.now() + Math.max(1000, Math.min(CFG.maxTurnMs, CFG.maxTotalMs));
   try {
-    result = repoTools.runTool(CFG.workdir, tool, args, {
+    result = await repoTools.runToolAsync(CFG.workdir, tool, args, {
       actionId,
       readonly: CFG.mode === 'readonly',
+      signal: abort.signal,
+      deadline,
+      decide: (leafTool, leafArgs) => policy.decide({
+        mode: CFG.mode,
+        tool: leafTool,
+        workspace: CFG.workdir,
+        target: String(leafArgs && (leafArgs.path || (leafArgs.changes && leafArgs.changes[0] && leafArgs.changes[0].path)
+          || (leafArgs.paths && leafArgs.paths[0])) || ''),
+      }),
     });
   } catch (e) {
     result = { ok: false, code: 'tool_error', error: e.message };
+  } finally {
+    process.removeListener('SIGINT', onAbort);
   }
   const durationMs = Date.now() - started;
   if (result && result.ok && tool === 'repo.read' && result.data) {
@@ -3205,6 +3220,18 @@ function languageLine() {
   return 'LANGUAGE: ' + (CFG.lang || 'en') + '. Keep code and protocol words unchanged.';
 }
 
+function batchToolLines() {
+  return [
+    '- Independent lookups: use tool.batch with up to 3 read actions, optional id.',
+    '  {"version":1,"tool":"tool.batch","args":{"actions":[{"id":"def","tool":"repo.search",',
+    '   "args":{"query":"restoreCheckpoint","match":"literal","scope":["src"],"limit":3}},',
+    '   {"id":"tests","tool":"repo.search","args":{"query":"stale_revision","match":"literal",',
+    '   "scope":["test"],"limit":3}}]}}',
+    '- Results keep input order and include id/status per action. Run sequentially when the',
+    '  next query needs a path or symbol returned by the previous one.',
+  ];
+}
+
 function buildLightPrompt() {
   const p = [];
   p.push('GOAL: ' + state.goal);
@@ -3222,8 +3249,9 @@ function buildLightPrompt() {
   p.push('- Local tools (no shell): reply with one JSON object in the block:');
   p.push('  {"version":1,"tool":"repo.search","args":{"query":"resume session","limit":5}}');
   p.push('  Also: repo.read, repo.list, repo.map, repo.symbol, repo.references,');
-  p.push('  repo.graph, repo.impact, repo.tests, repo.apply_patch, repo.rollback, tool.batch.');
+  p.push('  repo.graph, repo.impact, repo.tests, repo.diff, repo.locate, repo.apply_patch, repo.rollback, tool.batch.');
   p.push('  Read current source before editing; include expectedDigest when patching.');
+  for (const line of batchToolLines()) p.push(line);
   if (!CFG.noAttach && !CFG.perRun) {
     p.push('- Upload a workspace file: first line ATTACH, then {"file":"relative/path"}.');
   }
@@ -3294,12 +3322,13 @@ function buildPrompt() {
   p.push('- To search/read the repo, reply with ONE fenced block containing one JSON object:');
   p.push('  {"version":1,"tool":"repo.search","args":{"query":"resume session","strategy":"auto","limit":5}}');
   p.push('- Tools: repo.search, repo.read, repo.list, repo.map, repo.symbol,');
-  p.push('  repo.references, repo.graph, repo.impact, repo.tests,');
+  p.push('  repo.references, repo.graph, repo.impact, repo.tests, repo.diff, repo.locate,');
   p.push('  repo.apply_patch, repo.rollback, tool.batch.');
   p.push('- repo.read args: {"path":"src/a.js","from":1,"to":80,"expectedDigest":"sha256:..."}');
   p.push('- repo.apply_patch args: {"changes":[{"path":"src/a.js","find":"old","replace":"new",');
   p.push('  "expectedDigest":"sha256:..."}]}. Read the file first and include its digest.');
   p.push('- Search hits are excerpts. Call repo.read on current source before editing.');
+  for (const line of batchToolLines()) p.push(line);
 
   if (review) {
     p.push('- DEPTH OVER BREADTH: read the implementation, not just file names.');
