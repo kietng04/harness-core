@@ -151,10 +151,22 @@
     if (busy) return;
     const text = composer.innerText.trim();
     if (!text) return;
+    const flags = window.__mockFlags || {};
+    if (flags.sendDelayMs && !window.__mockDelayed) {
+      window.__mockDelayed = true;
+      busy = true;
+      status.textContent = 'delayed send';
+      setTimeout(() => {
+        busy = false;
+        send();
+      }, Number(flags.sendDelayMs) || 0);
+      return;
+    }
 
     appendTurn('user', text);
     composer.innerHTML = '';
     sends++;
+    window.__mockSends = sends;
     busy = true;
     status.textContent = 'thinking';
     stopBtn.hidden = false;
@@ -184,6 +196,18 @@
   composer.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
+      const flags = window.__mockFlags || {};
+      if (flags.ignoreAllEnter) {
+        window.__mockIgnoredEnters = (window.__mockIgnoredEnters || 0) + 1;
+        status.textContent = 'enter ignored';
+        return;
+      }
+      if (flags.ignoreFirstEnter && !window.__mockIgnoredOnce) {
+        window.__mockIgnoredOnce = true;
+        window.__mockIgnoredEnters = 1;
+        status.textContent = 'enter ignored once';
+        return;
+      }
       send();
     }
   });

@@ -147,6 +147,7 @@ const CFG = {
   pollMs: num('POLL_MS', 400),
   stablePolls: 2,
   postGenGraceMs: num('POST_GEN_GRACE_MS', 8000),
+  sendConfirmMs: num('SEND_CONFIRM_MS', 12000),
   checkpointEvery: num('CHECKPOINT_EVERY', 8),
   resetAfterTurns: num('AUTO_COMPACT_TURNS', num('RESET_AFTER_TURNS', 10)),
   loginWaitMs: num('LOGIN_WAIT_MS', 300000),
@@ -227,9 +228,20 @@ const SEL = {
     'button[data-testid="send"]',
     'button[data-testid="submit-button"]',
     'button[aria-label="Send"]',
+    'button[aria-label="Send message"]',
     'button[aria-label*="Send message"]',
     'button[aria-label*="Submit"]',
     'button[title="Send"]',
+    'button[title="Send message"]',
+    '[data-testid="send-button"]',
+  ],
+  userTurn: [
+    '[data-testid="user-message"]',
+    '[data-testid="user-message-div"]',
+    '[data-content="user-message"]',
+    'article.user',
+    '[data-testid="conversation-turn"].user',
+    '.user-message',
   ],
   stop: [
     'button[data-testid="stop-button"]',
@@ -1421,13 +1433,13 @@ async function runIndependentReview(page, ver) {
   const prompt = buildReviewPrompt(ver) + '\n\n' + skillsPromptBlock();
   let reply;
   try {
+    const sent = await sendPrompt(page, prompt);
     state.metrics = state.metrics || {};
     state.metrics.sends = (state.metrics.sends || 0) + 1;
     state.metrics.promptBytes = (state.metrics.promptBytes || 0) + Buffer.byteLength(prompt);
     state.metrics.promptChars = (state.metrics.promptChars || 0) + prompt.length;
     emitEvent('provider.waiting', { turn: state.turn, promptChars: prompt.length, review: true });
-    const before = await sendPrompt(page, prompt);
-    reply = await waitForReply(page, before, Date.now() + CFG.maxTurnMs);
+    reply = await waitForReply(page, sent.before, Date.now() + CFG.maxTurnMs);
   } catch (e) {
     const status = e.code === 'turn_timeout' ? 'timed_out' : 'unavailable';
     const result = {
@@ -2303,12 +2315,67 @@ async function firstVisible(page, selectors, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     for (const sel of selectors) {
-      const loc = page.locator(sel).first();
-      if (await loc.isVisible().catch(() => false)) return loc;
+      let count = 0;
+      try { count = await page.locator(sel).count(); } catch { continue; }
+      for (let i = 0; i < count; i++) {
+        const loc = page.locator(sel).nth(i);
+        if (await loc.isVisible().catch(() => false)) return loc;
+      }
     }
     await page.waitForTimeout(120);
   }
   return null;
+}
+
+async function findSendButton(page, timeoutMs = 1500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const sel of SEL.send) {
+      let count = 0;
+      try { count = await page.locator(sel).count(); } catch { continue; }
+      for (let i = 0; i < count; i++) {
+        const loc = page.locator(sel).nth(i);
+        const visible = await loc.isVisible().catch(() => false);
+        if (!visible) continue;
+        const enabled = await loc.isEnabled().catch(() => true);
+        if (enabled) return { loc, selector: sel };
+      }
+    }
+    await page.waitForTimeout(120);
+  }
+  return null;
+}
+
+function draftMatch(userText, draft) {
+  const normalize = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const u = normalize(userText);
+  const d = normalize(draft).slice(0, 80);
+  if (!u || !d) return false;
+  return u.includes(d) || d.includes(u.slice(0, 80));
+}
+
+async function waitForSubmit(page, before, draft, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    await page.waitForTimeout(100);
+    const s = await snapshot(page);
+    const newTurns = s.userTurns > (before.userTurns || 0);
+    const matched = newTurns && s.userTexts.some((t) => draftMatch(t, draft));
+    if (matched) {
+      return { confirmed: true, method: 'user-turn', userTurns: s.userTurns, composerText: s.composerText };
+    }
+    if (s.generating && !before.generating) {
+      return { confirmed: true, method: 'generating', userTurns: s.userTurns, composerText: s.composerText };
+    }
+  }
+  const s = await snapshot(page);
+  return {
+    confirmed: false,
+    method: 'none',
+    userTurns: s.userTurns,
+    composerText: s.composerText,
+    draftStillPresent: draftMatch(s.composerText, draft),
+  };
 }
 
 /*
@@ -2375,9 +2442,40 @@ async function snapshot(page) {
       if (n > 0) { turns = n; break; }
     }
 
-    return { generating, blocks, turns };
-  }, { stop: SEL.stop, code: SEL.code, turn: SEL.turn })
-    .catch(() => ({ generating: false, blocks: [], turns: 0 }));
+    const userTexts = [];
+    const seenUser = new Set();
+    for (const sel of sels.userTurn) {
+      let nodes;
+      try { nodes = document.querySelectorAll(sel); } catch { continue; }
+      for (const el of nodes) {
+        if (!visible(el) || seenUser.has(el)) continue;
+        seenUser.add(el);
+        const t = (el.innerText || '').trim();
+        if (t) userTexts.push(t);
+      }
+    }
+
+    let composerText = '';
+    for (const sel of sels.composer) {
+      let nodes;
+      try { nodes = document.querySelectorAll(sel); } catch { continue; }
+      for (const el of nodes) {
+        if (!visible(el)) continue;
+        composerText = (el.innerText || el.value || '').trim();
+        break;
+      }
+      if (composerText) break;
+    }
+
+    return { generating, blocks, turns, userTurns: userTexts.length, userTexts, composerText };
+  }, {
+    stop: SEL.stop,
+    code: SEL.code,
+    turn: SEL.turn,
+    userTurn: SEL.userTurn,
+    composer: SEL.composer,
+  })
+    .catch(() => ({ generating: false, blocks: [], turns: 0, userTurns: 0, userTexts: [], composerText: '' }));
 }
 
 function cleanBlock(text) {
@@ -2401,6 +2499,10 @@ async function marks(page) {
   return {
     blocks: s.blocks.length,
     turns: s.turns,
+    userTurns: s.userTurns,
+    userTexts: new Set(s.userTexts.map((t) => t.trim())),
+    composerText: s.composerText,
+    generating: s.generating,
     texts: new Set(s.blocks.map((b) => b.trim())),
   };
 }
@@ -2501,37 +2603,84 @@ async function sendPrompt(page, promptText) {
     throw new HarnessError('no_composer', 'Composer not found. Run: node agent.js --probe');
   }
 
+  const draft = String(promptText || '');
   const tag = await composer.evaluate((el) => el.tagName.toLowerCase()).catch(() => '');
   if (tag === 'textarea' || tag === 'input') {
-    await composer.fill(promptText);
+    await composer.fill(draft);
   } else {
     // Lexical / RoosterJS editors: fill() can collapse newlines.
     await composer.fill('');
     await composer.click().catch(() => {});
-    await page.keyboard.insertText(promptText);
+    await page.keyboard.insertText(draft);
   }
   await page.waitForTimeout(150);
 
-  const before = await marks(page);
+  let lastFailure = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const before = await marks(page);
+    let method = 'none';
+    const button = await findSendButton(page, 1500);
+    if (button) {
+      method = 'button:' + button.selector;
+      try {
+        await button.loc.click({ timeout: 2500 });
+      } catch {
+        method = 'composer-enter-after-button-failed';
+        await composer.click().catch(() => {});
+        await page.keyboard.press('Enter');
+      }
+    } else {
+      method = 'composer-enter';
+      await composer.click().catch(() => {});
+      await page.keyboard.press('Enter');
+    }
 
-  const sendBtn = await firstVisible(page, SEL.send, 1200);
-  if (sendBtn) {
-    await sendBtn.click({ timeout: 2000 }).catch(async () => { await page.keyboard.press('Enter'); });
-  } else {
-    await page.keyboard.press('Enter');
+    const started = Date.now();
+    const check = await waitForSubmit(page, before, draft, CFG.sendConfirmMs);
+    if (check.confirmed) {
+      log('SUBMIT: method=' + method + ' confirmation=' + check.method
+        + ' userTurns=' + check.userTurns + ' in ' + (Date.now() - started) + 'ms');
+      state.pendingDraft = '';
+      state.lastSubmit = {
+        status: 'confirmed',
+        method,
+        confirmation: check.method,
+        userTurns: check.userTurns,
+        at: Date.now(),
+      };
+      try { saveState(); } catch {}
+      return {
+        before,
+        submit: {
+          method,
+          confirmation: check.method,
+          userTurns: check.userTurns,
+          durationMs: Date.now() - started,
+        },
+      };
+    }
+
+    lastFailure = { method, check, attempt };
+    log('SUBMIT: no confirmation after ' + (Date.now() - started) + 'ms'
+      + ' (attempt ' + attempt + '/2, method=' + method
+      + ', userTurns=' + check.userTurns + ', draftStillPresent=' + check.draftStillPresent + ')');
+    if (!check.draftStillPresent || attempt === 2) break;
+    log('SUBMIT: retrying once because the original draft is still in the composer');
+    await composer.click().catch(() => {});
   }
 
-  const t0 = Date.now();
-  while (Date.now() - t0 < 12000) {
-    await page.waitForTimeout(150);
-    const s = await snapshot(page);
-    if (s.generating) return before;
-    if (s.blocks.length > before.blocks) return before;
-    if (before.turns > 0 && s.turns > before.turns) return before;
-  }
-
-  log('WARN: no sign the message was sent; continuing anyway');
-  return before;
+  state.pendingDraft = draft.slice(0, 8000);
+  state.lastSubmit = {
+    status: 'unconfirmed',
+    method: lastFailure && lastFailure.method,
+    userTurns: lastFailure && lastFailure.check && lastFailure.check.userTurns,
+    draftStillPresent: !!(lastFailure && lastFailure.check && lastFailure.check.draftStillPresent),
+    at: Date.now(),
+  };
+  try { saveState(); } catch {}
+  throw new HarnessError('send_unconfirmed',
+    'Prompt was not confirmed as sent (draft still in the composer). '
+    + 'No reply wait and no FORMAT nudge started; press Send/Enter in the Copilot window, then /continue.');
 }
 
 /* ------------------------------------------------------------- wait reply */
@@ -3630,8 +3779,8 @@ async function requestCompact(page) {
 
   let reply;
   try {
-    const before = await sendPrompt(page, prompt);
-    reply = await waitForReply(page, before, Date.now() + CFG.maxTurnMs);
+    const sent = await sendPrompt(page, prompt);
+    reply = await waitForReply(page, sent.before, Date.now() + CFG.maxTurnMs);
   } catch {
     return { ok: false, summary: '' };
   }
@@ -3847,6 +3996,25 @@ async function findMockPage(browser) {
     const parsed = JSON.parse(fs.readFileSync(repliesPath, 'utf8'));
     await page.evaluate((data) => { window.__mockReplies = data; }, parsed);
   }
+
+  const flags = {
+    hideSend: process.env.HARNESS_MOCK_HIDE_SEND === '1',
+    hideStop: process.env.HARNESS_MOCK_HIDE_STOP === '1',
+    ignoreFirstEnter: process.env.HARNESS_MOCK_IGNORE_ENTER === 'first',
+    ignoreAllEnter: process.env.HARNESS_MOCK_IGNORE_ENTER === 'all',
+    sendDelayMs: Number(process.env.HARNESS_MOCK_SEND_DELAY_MS) || 0,
+  };
+  await page.evaluate((f) => {
+    window.__mockFlags = f;
+    if (f.hideSend) {
+      const b = document.getElementById('send');
+      if (b) b.style.display = 'none';
+    }
+    if (f.hideStop) {
+      const b = document.getElementById('stop');
+      if (b) b.style.display = 'none';
+    }
+  }, flags);
   return page;
 }
 
@@ -3986,6 +4154,8 @@ async function runGoal(page, goal, opts = {}) {
     if (!text.includes('AVAILABLE SKILLS')) text += '\n\n' + skillsPromptBlock();
     const t0 = Date.now();
     promptChars = text.length;
+    const sent = await sendPrompt(page, text);
+    sendMs = Date.now() - t0;
     state.metrics = state.metrics || {};
     state.metrics.sends = (state.metrics.sends || 0) + 1;
     state.metrics.promptBytes = (state.metrics.promptBytes || 0) + Buffer.byteLength(text);
@@ -3995,15 +4165,13 @@ async function runGoal(page, goal, opts = {}) {
     if (state.notes) contextLedger.record(state, 'notes', 'memory', state.notes, state.turn);
     if (state.last) contextLedger.record(state, 'last', 'observation', formatObservation(state.last), state.turn);
     contextLedger.record(state, 'skills', 'skills', skillsPromptBlock(), state.turn);
-    const b = await sendPrompt(page, text);
-    sendMs = Date.now() - t0;
     emitEvent('provider.waiting', { turn: state.turn + 1, promptChars });
     emitPhase('waiting', {
       provider: CFG.mock ? 'mock' : 'edge-copilot',
       promptChars,
       turn: state.turn + 1,
     });
-    return b;
+    return sent.before;
   };
 
   const started = Date.now();
@@ -4796,6 +4964,17 @@ async function runGoal(page, goal, opts = {}) {
     before = await send(buildPrompt());
     }
   } catch (e) {
+    if (e.code === 'send_unconfirmed') {
+      return finishGoal({
+        status: 'partial',
+        reason: 'send_unconfirmed',
+        code: 'send_unconfirmed',
+        summary: 'Prompt chưa được xác nhận gửi; draft vẫn còn trong composer. '
+          + 'Không chờ reply và không gửi FORMAT ERROR. Nhấn Send/Enter trong Copilot rồi /continue.',
+        canResume: true,
+        verification: currentVerification(),
+      });
+    }
     if (['no_session', 'already_done', 'session_corrupt', 'verification_spec_changed',
       'verification_unavailable', 'verification_invalid'].includes(e.code)) {
       throw e;
