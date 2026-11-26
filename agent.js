@@ -1433,7 +1433,7 @@ async function runIndependentReview(page, ver) {
   const prompt = buildReviewPrompt(ver) + '\n\n' + skillsPromptBlock();
   let reply;
   try {
-    const sent = await sendPrompt(page, prompt);
+    const sent = await sendPrompt(page, prompt, { kind: 'review' });
     state.metrics = state.metrics || {};
     state.metrics.sends = (state.metrics.sends || 0) + 1;
     state.metrics.promptBytes = (state.metrics.promptBytes || 0) + Buffer.byteLength(prompt);
@@ -2597,7 +2597,7 @@ async function uploadAttachment(page, absPath) {
 
 /* ------------------------------------------------------------------- send */
 
-async function sendPrompt(page, promptText) {
+async function sendPrompt(page, promptText, meta = {}) {
   const composer = await firstVisible(page, SEL.composer, 20000);
   if (!composer) {
     throw new HarnessError('no_composer', 'Composer not found. Run: node agent.js --probe');
@@ -2643,6 +2643,7 @@ async function sendPrompt(page, promptText) {
       state.pendingDraft = '';
       state.lastSubmit = {
         status: 'confirmed',
+        kind: meta.kind || 'main',
         method,
         confirmation: check.method,
         userTurns: check.userTurns,
@@ -2660,7 +2661,7 @@ async function sendPrompt(page, promptText) {
       };
     }
 
-    lastFailure = { method, check, attempt };
+    lastFailure = { method, check, attempt, before };
     log('SUBMIT: no confirmation after ' + (Date.now() - started) + 'ms'
       + ' (attempt ' + attempt + '/2, method=' + method
       + ', userTurns=' + check.userTurns + ', draftStillPresent=' + check.draftStillPresent + ')');
@@ -2672,7 +2673,13 @@ async function sendPrompt(page, promptText) {
   state.pendingDraft = draft.slice(0, 8000);
   state.lastSubmit = {
     status: 'unconfirmed',
+    kind: meta.kind || 'main',
     method: lastFailure && lastFailure.method,
+    beforeBlocks: lastFailure && lastFailure.before ? lastFailure.before.blocks : 0,
+    beforeTurns: lastFailure && lastFailure.before ? lastFailure.before.turns : 0,
+    beforeUserTurns: lastFailure && lastFailure.before ? lastFailure.before.userTurns : 0,
+    beforeGenerating: !!(lastFailure && lastFailure.before && lastFailure.before.generating),
+    beforeTexts: lastFailure && lastFailure.before ? [...lastFailure.before.texts].slice(-50) : [],
     userTurns: lastFailure && lastFailure.check && lastFailure.check.userTurns,
     draftStillPresent: !!(lastFailure && lastFailure.check && lastFailure.check.draftStillPresent),
     at: Date.now(),
@@ -3797,7 +3804,7 @@ async function requestCompact(page) {
 
   let reply;
   try {
-    const sent = await sendPrompt(page, prompt);
+    const sent = await sendPrompt(page, prompt, { kind: 'compact' });
     reply = await waitForReply(page, sent.before, Date.now() + CFG.maxTurnMs);
   } catch {
     return { ok: false, summary: '' };
@@ -4185,7 +4192,7 @@ async function runGoal(page, goal, opts = {}) {
   let sendMs = 0;
   let promptChars = 0;
   let lastFreshTurn = -1;
-  const send = async (promptText) => {
+  const send = async (promptText, sendOpts = {}) => {
     // --per-run: a new chat for every executed turn. The prompt is fully
     // self-contained, so losing the chat history costs nothing except the
     // (already bounded) plan/notes, which are re-injected from disk.
@@ -4197,10 +4204,10 @@ async function runGoal(page, goal, opts = {}) {
     let text = String(promptText);
     // Every provider prompt carries the full skill list exactly once,
     // including format/retry nudges that do not call buildPrompt().
-    if (!text.includes('AVAILABLE SKILLS')) text += '\n\n' + skillsPromptBlock();
+    if (sendOpts.appendSkills !== false && !text.includes('AVAILABLE SKILLS')) text += '\n\n' + skillsPromptBlock();
     const t0 = Date.now();
     promptChars = text.length;
-    const sent = await sendPrompt(page, text);
+    const sent = await sendPrompt(page, text, { kind: sendOpts.kind || 'main' });
     sendMs = Date.now() - t0;
     state.metrics = state.metrics || {};
     state.metrics.sends = (state.metrics.sends || 0) + 1;
@@ -4329,7 +4336,38 @@ async function runGoal(page, goal, opts = {}) {
 
   let before;
   try {
-    before = await send(buildPrompt());
+    const pending = opts.resume && state.lastSubmit
+      && state.lastSubmit.status === 'unconfirmed' && state.lastSubmit.kind === 'main'
+      ? String(state.pendingDraft || '') : '';
+    if (pending) {
+      const s = await snapshot(page);
+      const submitted = s.userTurns > (state.lastSubmit.beforeUserTurns || 0)
+        && s.userTexts.some((t) => draftMatch(t, pending));
+      if (submitted) {
+        log('RESUME: pending draft was already submitted manually; waiting for its reply');
+        before = {
+          blocks: state.lastSubmit.beforeBlocks || 0,
+          turns: state.lastSubmit.beforeTurns || 0,
+          userTurns: state.lastSubmit.beforeUserTurns || 0,
+          texts: new Set(state.lastSubmit.beforeTexts || []),
+          composerText: '',
+          generating: !!state.lastSubmit.beforeGenerating,
+        };
+        state.pendingDraft = '';
+        state.lastSubmit.status = 'manual-confirmed';
+        saveState();
+        emitPhase('waiting', { resumed: true, manualSubmit: true, turn: state.turn + 1 });
+      } else if (draftMatch(s.composerText, pending)) {
+        log('RESUME: pending draft is still in the composer; submitting it once');
+        before = await send(pending, { appendSkills: false, kind: 'main' });
+      } else {
+        throw new HarnessError('send_unconfirmed',
+          'Pending draft is no longer in the composer and no matching user turn was found. '
+          + 'Inspect the Copilot tab before /continue; no new prompt was sent.');
+      }
+    } else {
+      before = await send(buildPrompt());
+    }
 
     while (true) {
       if (state.turn - startTurn >= CFG.maxTurns && !finalTurn) {

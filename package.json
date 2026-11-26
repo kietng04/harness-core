@@ -9,7 +9,7 @@
   },
   "scripts": {
     "selftest": "node agent.js --selftest",
-    "test": "node agent.js --selftest && node test/send-confirmation.js && node test/tab-isolation.js && node test/policy-context-graph.js && node test/call-hierarchy.js && node test/repo-tools.js && node test/batch-search.js && node test/ab-review.js && node test/e2e-mock.js && node test/mcp-smoke.js && node test/regression.js && node test/pty-tui.js",
+    "test": "node agent.js --selftest && node test/send-confirmation.js && node test/resume-manual-submit.js && node test/tab-isolation.js && node test/policy-context-graph.js && node test/call-hierarchy.js && node test/repo-tools.js && node test/batch-search.js && node test/ab-review.js && node test/e2e-mock.js && node test/mcp-smoke.js && node test/regression.js && node test/pty-tui.js",
     "tui": "node tui.mjs",
     "mock": "node agent.js --mock",
     "mcp": "node mcp-server.js"

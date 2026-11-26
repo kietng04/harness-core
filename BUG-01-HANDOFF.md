@@ -40,6 +40,21 @@ Cases:
 4. No Stop button + delayed user turn → confirmation waits and still creates
    exactly one user turn.
 
+## Follow-up P2 — manual submit before /continue
+
+`sendPrompt()` now records the pre-submit snapshot and kind on
+`state.lastSubmit` when it returns `send_unconfirmed`. On resume:
+
+- If a new user turn matches `state.pendingDraft`, harness **does not send
+  buildPrompt()**. It reconstructs the pre-submit mark and waits for the reply
+  already in flight.
+- If the original draft is still in the composer, it resubmits that exact draft
+  once (no `buildPrompt()`), then waits.
+- If neither is true, it returns `send_unconfirmed` without sending anything.
+
+Fixture `test/resume-manual-submit.js`: unconfirmed run → manual Enter in the
+owned tab → `/continue`; asserts one user turn and no duplicate submit.
+
 ## Verification
 
 ```text
