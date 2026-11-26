@@ -801,6 +801,25 @@ async function runBatchAsync(workspace, args = {}, opts = {}) {
   ));
 
   if (sameGroup) {
+    const remaining = opts.deadline ? opts.deadline - Date.now() : null;
+    if (remaining != null && remaining <= 0) {
+      for (const { action, i } of pending) {
+        results[i] = {
+          id: action.id, tool: action.tool, ok: false,
+          code: 'timeout', error: 'batch deadline exceeded', status: 'timeout',
+        };
+      }
+      return {
+        ok: true,
+        data: {
+          results,
+          skipped,
+          concurrency: 1,
+          scans: 0,
+          durationMs: Date.now() - started,
+        },
+      };
+    }
     scans = 1;
     const grouped = await search.searchPatternGroupAsync(workspace, {
       queries: pending.map(({ action }) => ({ id: action.id, query: action.args.query })),
@@ -808,7 +827,10 @@ async function runBatchAsync(workspace, args = {}, opts = {}) {
       caseSensitive: pending[0].action.args.caseSensitive === true,
       limit: Number(pending[0].action.args.limit) || 5,
       backend: pending[0].action.args.backend,
-    }, opts);
+    }, {
+      ...opts,
+      timeoutMs: remaining != null ? Math.max(100, Math.min(Number(opts.timeoutMs) || 10000, remaining)) : opts.timeoutMs,
+    });
     for (const { action, i } of pending) {
       if (!grouped.ok) {
         results[i] = { id: action.id, tool: action.tool, ok: false, code: grouped.code, error: grouped.error, status: leafStatus(grouped) };

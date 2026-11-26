@@ -102,6 +102,28 @@ function stripStrings(line) {
   return line.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g, ' ');
 }
 
+function functionBodyRange(lines, startLine) {
+  const start = Math.max(0, startLine - 1);
+  let opened = false;
+  let depth = 0;
+  let sawBrace = false;
+  const endLimit = Math.min(lines.length - 1, start + 200);
+  for (let i = start; i <= endLimit; i++) {
+    const line = stripStrings(stripComments(lines[i] || ''));
+    for (const ch of line) {
+      if (ch === '{') { depth++; opened = true; sawBrace = true; }
+      else if (ch === '}') { depth--; sawBrace = true; }
+    }
+    if (sawBrace && opened && depth <= 0) return { from: start, to: i, scope: 'brace-matched' };
+    if (!opened && i - start >= 4) break;
+  }
+  if (!sawBrace) {
+    // Arrow expression or unknown one-line body: only claim the declaration line.
+    return { from: start, to: start, scope: 'unknown-one-line' };
+  }
+  return { from: start, to: Math.min(endLimit, start + 80), scope: 'truncated' };
+}
+
 function callHierarchy(workspace, args = {}) {
   const symbolArg = String(args.symbol || args.query || '').trim();
   const targetPath = args.path ? String(args.path).replace(/^\.\//, '') : '';
@@ -232,22 +254,27 @@ function callHierarchy(workspace, args = {}) {
 
   // One-hop callees from the selected definition body.
   const callees = [];
+  const calleeCoverage = [];
   for (const def of selected.slice(0, 2)) {
     const text = read(workspace, def.path, cache);
     const lines = text.split('\n');
-    for (let i = def.line - 1; i < Math.min(lines.length, def.line + 80); i++) {
-      const line = stripComments(lines[i] || '');
+    const range = functionBodyRange(lines, def.line);
+    calleeCoverage.push({ path: def.path, line: def.line, from: range.from + 1, to: range.to + 1, scope: range.scope });
+    for (let i = range.from; i <= range.to; i++) {
+      const line = stripStrings(stripComments(lines[i] || ''));
       for (const m of line.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) {
         const name = m[1];
         if (name === symbol || KEYWORDS.has(name)) continue;
+        // Skip the declaration line's own function name.
+        if (i === def.line - 1 && name === symbol) continue;
         callees.push({
           path: def.path,
           line: i + 1,
           column: m.index + 1,
           symbol: name,
           kind: 'callee',
-          confidence: 0.5,
-          evidence: 'same-file call in definition body',
+          confidence: range.scope === 'brace-matched' ? 0.6 : 0.4,
+          evidence: 'same-file call in ' + range.scope + ' body',
           revision: sha256(text),
         });
       }
@@ -268,6 +295,7 @@ function callHierarchy(workspace, args = {}) {
         semantic: false,
         language: 'js/ts',
         filesScanned: files.length,
+        calleeScope: calleeCoverage,
         note: 'candidate call hierarchy; a local LSP/compiler backend can replace this layer',
       },
       revision: exact ? exact.digest : null,

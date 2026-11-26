@@ -28,6 +28,11 @@ try {
     '  return helper(value);',
     '}',
     'function helper(value) { return value; }',
+    'function unrelated() {',
+    '  // falseCallee() is a comment',
+    '  const s = "falseCallee() is a string";',
+    '  return falseCallee();',
+    '}',
   ].join('\n'));
   fs.writeFileSync(path.join(root, 'src', 'b.js'), [
     'export function run(value) {',
@@ -76,6 +81,8 @@ try {
   check('unresolved reference kept', exact.data.callers.some((c) => c.path === 'src/other.js' && c.kind === 'reference'), true);
   check('dynamic unresolved', exact.data.unresolved.some((u) => u.path === 'src/dynamic.js'), true);
   check('callee helper', exact.data.callees.some((c) => c.symbol === 'helper'), true);
+  check('adjacent callee excluded', exact.data.callees.some((c) => c.symbol === 'falseCallee'), false);
+  check('callee scope reported', exact.data.coverage.calleeScope.some((c) => c.scope === 'brace-matched'), true);
   check('semantic false', exact.data.coverage.semantic, false);
   check('backend coverage', exact.data.coverage.backend, 'regex-import-graph');
   check('revision present', /^sha256:/.test(exact.data.revision || ''), true);

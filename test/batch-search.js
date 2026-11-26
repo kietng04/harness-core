@@ -35,6 +35,8 @@ async function main() {
     'const twice = "a+b [x]"; // a+b [x] again',
     'module.exports = { restoreCheckpoint };',
   ].join('\n'));
+  fs.writeFileSync(path.join(work, 'src', 'case.txt'), 'ALPHA only\n');
+  fs.writeFileSync(path.join(work, 'src', 'columns.js'), 'const alpha = 1; const beta = 2;\n');
   fs.writeFileSync(path.join(work, 'test', 'resume.test.js'), [
     '// restoreCheckpoint stale_revision',
     'const x = "a+b [x]";',
@@ -52,6 +54,14 @@ async function main() {
     }, {});
     check('node fallback backend', nodeLiteral.data.backend, 'node');
     check('node fallback hit', nodeLiteral.data.hits.length >= 1, true);
+    const nodeNoMatch = await search.searchPatternAsync(work, {
+      query: 'doesNotExist', match: 'regex', scope: ['src'], limit: 5, backend: 'node',
+    }, {});
+    check('node regex no match', nodeNoMatch.data.hits.length, 0);
+    const nodeCase = await search.searchPatternAsync(work, {
+      query: 'alpha', match: 'literal', scope: ['src/case.txt'], limit: 5, backend: 'node', caseSensitive: true,
+    }, {});
+    check('node case-sensitive literal', nodeCase.data.hits.length, 0);
 
     const regex = tools.runTool(work, 'repo.search', {
       query: 'restoreCheckpoint\\s*\\(', match: 'regex', scope: ['src'], limit: 5,
@@ -90,6 +100,26 @@ async function main() {
       ],
     });
     check('batch grouped scans', groupedSame.data.scans, 1);
+
+    const columns = await tools.runBatchAsync(work, {
+      actions: [
+        { id: 'alpha', tool: 'repo.search', args: { query: 'alpha', match: 'literal', scope: ['src/columns.js'], limit: 2 } },
+        { id: 'beta', tool: 'repo.search', args: { query: 'beta', match: 'literal', scope: ['src/columns.js'], limit: 2 } },
+      ],
+    });
+    const alphaCol = columns.data.results[0].data.hits[0].column;
+    const betaCol = columns.data.results[1].data.hits[0].column;
+    check('grouped column alpha', alphaCol, 7);
+    check('grouped column beta', betaCol, 24);
+    check('grouped columns differ', alphaCol !== betaCol, true);
+    const expired = await tools.runBatchAsync(work, {
+      actions: [
+        { id: 'a', tool: 'repo.search', args: { query: 'alpha', match: 'literal', scope: ['src'], limit: 2 } },
+        { id: 'b', tool: 'repo.search', args: { query: 'beta', match: 'literal', scope: ['src'], limit: 2 } },
+      ],
+    }, { deadline: Date.now() - 1 });
+    check('expired batch timeout', expired.data.results.every((r) => r.status === 'timeout'), true);
+    check('expired batch scans', expired.data.scans, 0);
 
     const mixed = await tools.runBatchAsync(work, {
       actions: [

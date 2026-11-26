@@ -3733,26 +3733,44 @@ async function waitForAnyComposer(browser, timeoutMs, why) {
 }
 
 async function findCopilotPage(browser) {
+  const canonical = fs.realpathSync(CFG.workdir);
   const pages = allPages(browser).filter((pg) => isCopilotUrl(pg.url()));
-  if (pages.length) {
-    let wanted = '';
-    try { wanted = new URL(CFG.chatUrl).hostname.toLowerCase(); } catch {}
-    const exact = pages.filter((pg) => pageHost(pg) === wanted);
-    const pool = exact.length ? exact : pages;
-
-    // A Copilot tab can exist while another tab sits on the Microsoft login.
-    // Prefer the tab that actually has a composer.
-    for (const pg of pool) {
-      if (await composerVisibleInPage(pg)) return pg;
+  for (const pg of pages) {
+    if (await pageOwner(pg) === canonical && await composerVisibleInPage(pg)) {
+      log('TAB: reusing owned Copilot tab for workspace');
+      return pg;
     }
-    return pool[pool.length - 1];
   }
 
   const contexts = browser.contexts();
-  const ctx = contexts.length ? contexts[0] : await browser.newContext();
+  const ctx = contexts.find((c) => c.pages().some((p) => isCopilotUrl(p.url())))
+    || (contexts.length ? contexts[0] : await browser.newContext());
   const page = await ctx.newPage();
   await page.goto(CFG.chatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await waitForComposer(page, 30000, 'Copilot composer');
+  await setPageOwner(page, canonical);
+  log('TAB: opened dedicated Copilot tab for workspace');
   return page;
+}
+
+const PAGE_OWNER_KEY = 'harness.workspace';
+
+async function pageOwner(page) {
+  try {
+    return await page.evaluate((key) => {
+      try { return sessionStorage.getItem(key) || ''; } catch { return ''; }
+    }, PAGE_OWNER_KEY);
+  } catch {
+    return '';
+  }
+}
+
+async function setPageOwner(page, workspace) {
+  try {
+    await page.evaluate(({ key, value }) => {
+      try { sessionStorage.setItem(key, value); } catch {}
+    }, { key: PAGE_OWNER_KEY, value: workspace });
+  } catch {}
 }
 
 /*
@@ -3899,6 +3917,16 @@ async function startMock() {
     throw new HarnessError('no_mock', 'Missing mock page: ' + html);
   }
 
+  if (process.env.HARNESS_MOCK_CDP) {
+    CFG.cdp = process.env.HARNESS_MOCK_CDP;
+    CFG.chatUrl = process.env.HARNESS_MOCK_URL || pathToFileURL(html).href;
+    CFG.mock = true;
+    const v = await waitForCdp(CFG.cdp, 15000);
+    if (!v) throw new HarnessError('mock_cdp', 'External mock CDP is not reachable: ' + CFG.cdp);
+    log('MOCK: external CDP ' + CFG.cdp);
+    return;
+  }
+
   const port = await getFreePort();
   mockProfileDir = path.join(os.tmpdir(), 'copilot-harness-mock-' + process.pid);
   fs.mkdirSync(mockProfileDir, { recursive: true });
@@ -3978,17 +4006,29 @@ async function waitForComposer(page, timeoutMs, why) {
 }
 
 async function findMockPage(browser) {
+  const canonical = fs.realpathSync(CFG.workdir);
   const contexts = browser.contexts();
   const ctx = contexts.length ? contexts[0] : await browser.newContext();
-  let page = ctx.pages().find((p) => p.url().startsWith('file:'));
-  if (!page) page = ctx.pages()[0];
-  if (!page) page = await ctx.newPage();
-  if (!page.url().startsWith('file:')) {
-    await page.goto(CFG.chatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  for (const page of ctx.pages()) {
+    if (!page.url().startsWith('file:')) continue;
+    if (await pageOwner(page) === canonical) {
+      await page.bringToFront();
+      await waitForComposer(page, 15000, 'mock composer');
+      await injectMockFlags(page);
+      return page;
+    }
   }
-  await page.bringToFront();
-  await waitForComposer(page, 15000, 'mock composer');
 
+  const page = await ctx.newPage();
+  await page.goto(CFG.chatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(300);
+  await waitForComposer(page, 15000, 'mock composer');
+  await setPageOwner(page, canonical);
+  await injectMockFlags(page);
+  return page;
+}
+
+async function injectMockFlags(page) {
   // Tests can script replies from a JSON file. Each entry is either a reply
   // string or {reply}. After the list is exhausted, fallback is used.
   const repliesPath = process.env.HARNESS_MOCK_REPLIES;
@@ -4015,7 +4055,6 @@ async function findMockPage(browser) {
       if (b) b.style.display = 'none';
     }
   }, flags);
-  return page;
 }
 
 /* ------------------------------------------------------------- json result */
@@ -4113,6 +4152,13 @@ async function runGoal(page, goal, opts = {}) {
   log('=== turn ' + state.turn + ', invocation budget ' + CFG.maxTurns);
 
   try { state.chatUrl = page.url(); saveState(); } catch {}
+  const chatWorkspace = fs.realpathSync(CFG.workdir);
+  if (opts.resume && state.chatWorkspace && state.chatWorkspace !== chatWorkspace) {
+    throw new HarnessError('conversation_mismatch',
+      'This session was recorded for another workspace; refusing to send into the wrong Copilot tab.');
+  }
+  state.chatWorkspace = chatWorkspace;
+  try { saveState(); } catch {}
   emitEvent('run.started', {
     goal: state.goal,
     mode: CFG.mode,
@@ -5826,7 +5872,14 @@ async function main() {
       throw new HarnessError('login_timeout',
         'Copilot composer did not appear. Sign in in the Edge window, then re-run --login.');
     }
-    page = found;
+    const canonical = fs.realpathSync(CFG.workdir);
+    const owner = await pageOwner(found);
+    if (!owner || owner === canonical) {
+      await setPageOwner(found, canonical);
+      page = found;
+    } else {
+      page = await findCopilotPage(browser);
+    }
     log('PAGE: ' + page.url());
   }
 

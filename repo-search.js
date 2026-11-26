@@ -383,12 +383,20 @@ function makeMatcher(args) {
     }
     return {
       test: (line) => re.test(line),
+      re,
+      query,
+      match: 'regex',
+      caseSensitive,
       flags: caseSensitive ? [] : ['-i'],
       rg: ['-e', query],
     };
   }
   return {
     test: (line) => caseSensitive ? line.includes(query) : line.toLowerCase().includes(query.toLowerCase()),
+    re: null,
+    query,
+    match: 'literal',
+    caseSensitive,
     flags: caseSensitive ? [] : ['-i'],
     rg: ['-F', '-e', query],
   };
@@ -640,18 +648,21 @@ async function searchPatternGroupAsync(root, args, opts = {}) {
 
   const assign = (rel, lineNo, col, line) => {
     const hay = caseSensitive ? line : line.toLowerCase();
-    const lines = line;
     for (const q of queries) {
-      const needle = caseSensitive ? q.query : String(q.query).toLowerCase();
+      const needle = caseSensitive ? String(q.query) : String(q.query).toLowerCase();
       if (!hay.includes(needle)) continue;
       if (groups[q.id].hits.length >= limit) {
         groups[q.id].truncated = true;
         continue;
       }
+      const idx = hay.indexOf(needle);
+      let count = 0;
+      let at = 0;
+      while (needle && (at = hay.indexOf(needle, at)) >= 0) { count++; at += Math.max(1, needle.length); }
       groups[q.id].hits.push({
-        path: rel, from: lineNo, to: lineNo, line: lineNo, column: col + 1,
-        symbol: '', score: 10, reason: 'literal match (grouped)', snippet: lines.trim().slice(0, 1200),
-        matchText: line.trim().slice(0, 300), matchCount: 1,
+        path: rel, from: lineNo, to: lineNo, line: lineNo, column: idx + 1,
+        symbol: '', score: 10, reason: 'literal match (grouped)', snippet: line.trim().slice(0, 1200),
+        matchText: line.trim().slice(0, 300), matchCount: count || 1,
       });
     }
   };
