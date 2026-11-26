@@ -113,6 +113,122 @@ function referencesRepo(workspace, args = {}) {
   return { ok: true, data: { symbol: name, hits } };
 }
 
+const IMPORT_RE = /(?:require\s*\(\s*|from\s+|import\s*\(\s*)['"]([^'"]+)['"]/g;
+
+function resolveImport(workspace, fromRel, spec, fileSet) {
+  if (!spec.startsWith('.')) return null;
+  const base = path.resolve(path.dirname(path.join(workspace, fromRel)), spec);
+  const candidates = [base, base + '.js', base + '.mjs', base + '.cjs', base + '.ts',
+    base + '.tsx', base + '.jsx', base + '.py', base + '.go', base + '.rs',
+    path.join(base, 'index.js'), path.join(base, 'index.ts')];
+  for (const c of candidates) {
+    if (fileSet.has(toPosix(path.relative(workspace, c)))) return toPosix(path.relative(workspace, c));
+  }
+  return null;
+}
+
+function graphRepo(workspace, args = {}) {
+  const files = search.walk(workspace, args.scope || ['.'], Number(args.depth) || 8);
+  const fileSet = new Set(files.map((f) => f.rel));
+  const nodes = files.map((f) => ({ path: f.rel, kind: path.extname(f.rel).slice(1) || 'file' }));
+  const edges = [];
+  const unresolved = [];
+  let bytes = 0;
+  for (const file of files) {
+    let text;
+    try { text = readText(file.abs); } catch { continue; }
+    bytes += text.length;
+    if (bytes > 8 * 1024 * 1024) break;
+    IMPORT_RE.lastIndex = 0;
+    for (const m of text.matchAll(IMPORT_RE)) {
+      const to = resolveImport(workspace, file.rel, m[1], fileSet);
+      if (to) edges.push({ from: file.rel, to, kind: 'import' });
+      else unresolved.push({ from: file.rel, spec: m[1] });
+      if (edges.length >= 5000) break;
+    }
+    if (edges.length >= 5000) break;
+  }
+  return {
+    ok: true,
+    data: {
+      nodes: nodes.slice(0, 1000),
+      edges: edges.slice(0, 5000),
+      unresolved: unresolved.slice(0, 200),
+      truncated: nodes.length > 1000 || edges.length >= 5000,
+    },
+  };
+}
+
+function impactRepo(workspace, args = {}) {
+  const changed = Array.isArray(args.paths) ? args.paths.map(String) : [String(args.path || '')].filter(Boolean);
+  if (!changed.length) return { ok: false, code: 'invalid_args', error: 'path or paths[] is required' };
+  const graph = graphRepo(workspace, { depth: 12 });
+  if (!graph.ok) return graph;
+  const reverse = new Map();
+  for (const edge of graph.data.edges) {
+    if (!reverse.has(edge.to)) reverse.set(edge.to, []);
+    reverse.get(edge.to).push(edge.from);
+  }
+  const affected = new Set();
+  const queue = changed.map((p) => ({ path: p.replace(/^\.\//, ''), depth: 0 }));
+  while (queue.length) {
+    const cur = queue.shift();
+    if (cur.depth > 2) continue;
+    for (const from of reverse.get(cur.path) || []) {
+      if (affected.has(from)) continue;
+      affected.add(from);
+      queue.push({ path: from, depth: cur.depth + 1 });
+    }
+  }
+  return {
+    ok: true,
+    data: {
+      changed,
+      affected: [...affected].slice(0, 100),
+      edges: graph.data.edges.filter((e) => changed.includes(e.from) || affected.has(e.from)).slice(0, 200),
+      advisory: true,
+    },
+  };
+}
+
+function testsRepo(workspace, args = {}) {
+  const changed = Array.isArray(args.paths) ? args.paths.map(String) : [String(args.path || '')].filter(Boolean);
+  if (!changed.length) return { ok: false, code: 'invalid_args', error: 'path or paths[] is required' };
+  const tokens = new Set();
+  for (const rel of changed) {
+    const base = path.basename(rel).replace(/\.[^.]+$/, '');
+    for (const t of base.split(/[^A-Za-z0-9]+/)) if (t.length > 2) tokens.add(t.toLowerCase());
+    for (const part of base.split(/(?=[A-Z])/)) if (part.length > 2) tokens.add(part.toLowerCase());
+  }
+  const suggestions = [];
+  for (const file of search.walk(workspace, args.scope || ['.'], 12)) {
+    if (!/(^|\/)(__tests__|test|tests|spec)(\/|\.)|\.(test|spec)\./i.test(file.rel)) continue;
+    const lower = file.rel.toLowerCase();
+    const score = [...tokens].filter((t) => lower.includes(t)).length;
+    if (score) suggestions.push({ path: file.rel, score, reason: 'name overlap: ' + [...tokens].filter((t) => lower.includes(t)).join(', ') });
+  }
+  suggestions.sort((a, b) => b.score - a.score);
+  return { ok: true, data: { changed, suggestions: suggestions.slice(0, 10), advisory: true } };
+}
+
+function backendUnavailable(tool) {
+  return {
+    ok: false,
+    code: 'policy_unavailable',
+    error: tool + ' needs HARNESS_EXECUTION_BACKEND with an approved execution backend',
+  };
+}
+
+function diagnosticsRepo(workspace, args = {}) {
+  if (!process.env.HARNESS_EXECUTION_BACKEND) return backendUnavailable('workspace.diagnostics');
+  return { ok: false, code: 'policy_unavailable', error: 'diagnostics adapter is not configured for this backend' };
+}
+
+function testRepo(workspace, args = {}) {
+  if (!process.env.HARNESS_EXECUTION_BACKEND) return backendUnavailable('workspace.test');
+  return { ok: false, code: 'policy_unavailable', error: 'test recipe runner is not configured for this backend' };
+}
+
 function validateChanges(workspace, changes) {
   if (!Array.isArray(changes) || !changes.length) {
     return { ok: false, code: 'invalid_args', error: 'changes[] is required' };
@@ -272,7 +388,7 @@ function rollback(workspace, args = {}, actionId) {
 function runBatch(workspace, args = {}) {
   const actions = Array.isArray(args.actions) ? args.actions.slice(0, 3) : [];
   if (!actions.length) return { ok: false, code: 'invalid_args', error: 'actions[] is required (max 3)' };
-  const allowed = new Set(['repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol', 'repo.references']);
+  const allowed = new Set(['repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol', 'repo.references', 'repo.graph', 'repo.impact', 'repo.tests']);
   const results = [];
   let bytes = 0;
   for (const action of actions) {
@@ -301,6 +417,11 @@ function runTool(workspace, name, args = {}, opts = {}) {
     case 'repo.map': return mapRepo(workspace, args);
     case 'repo.symbol': return symbolRepo(workspace, args);
     case 'repo.references': return referencesRepo(workspace, args);
+    case 'repo.graph': return graphRepo(workspace, args);
+    case 'repo.impact': return impactRepo(workspace, args);
+    case 'repo.tests': return testsRepo(workspace, args);
+    case 'workspace.diagnostics': return diagnosticsRepo(workspace, args);
+    case 'workspace.test': return testRepo(workspace, args);
     case 'repo.apply_patch':
       if (opts.readonly) return { ok: false, code: 'policy_denied', error: 'read-only mode' };
       return applyPatch(workspace, args, opts.actionId);
@@ -320,4 +441,7 @@ module.exports = {
   mapRepo,
   symbolRepo,
   referencesRepo,
+  graphRepo,
+  impactRepo,
+  testsRepo,
 };

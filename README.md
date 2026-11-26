@@ -322,10 +322,25 @@ Copilot dùng typed tool qua fenced JSON:
 ```
 
 Các tool: `repo.search`, `repo.read`, `repo.list`, `repo.map`, `repo.symbol`,
-`repo.references`, `repo.apply_patch`, `repo.rollback`, `tool.batch`. Patch validate digest,
+`repo.references`, `repo.graph`, `repo.impact`, `repo.tests`,
+`repo.apply_patch`, `repo.rollback`, `tool.batch`, `workspace.diagnostics`,
+`workspace.test`. Patch validate digest,
 ghi journal `.harness/journal/`, atomic rename; readonly/preview bị chặn; rollback
 chỉ chạy khi file hiện tại đúng after-digest.
 TUI cũng có `/search <query>` và `/index`.
+
+### Policy, context và graph
+
+- `policy.js`: capability read/write/process/send, preview/readonly/ask/yolo,
+  path scope, secret denial, audit `.harness/audit.jsonl`.
+- Lock workspace dùng `open(..., 'wx')` exclusive create, không check-then-write.
+- `context-ledger.js`: digest/epoch/duplicate bytes; patch/rollback làm stale
+  read coverage và ledger entry của file đã sửa.
+- `repo.graph`, `repo.impact`, `repo.tests`: import graph, affected files và
+  test gần change (advisory). `workspace.diagnostics`/`workspace.test` fail-closed
+  nếu chưa có `HARNESS_EXECUTION_BACKEND`.
+- Metrics result có `sends`, `promptBytes`, `execMs`, `toolMs`, `verifyMs`,
+  `reviewMs`, `context`.
 
 ### Ảnh từ clipboard
 

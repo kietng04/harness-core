@@ -118,6 +118,8 @@ const crypto = require('crypto');
 const { pathToFileURL } = require('url');
 const repoSearch = require('./repo-search');
 const repoTools = require('./repo-tools');
+const policy = require('./policy');
+const contextLedger = require('./context-ledger');
 
 /* ------------------------------------------------------------------ config */
 
@@ -455,18 +457,37 @@ function acquireWorkspaceLock() {
     mode: CFG.mode,
     at: new Date().toISOString(),
   };
-  try {
-    const old = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-    const stale = !pidAlive(old.pid) || (Date.now() - Date.parse(old.at) > CFG.lockTtlMs);
-    if (!stale) {
-      throw new HarnessError('workspace_busy',
-        'Another harness run owns this workspace (pid ' + old.pid + ', run ' + old.runId + ').');
+  const writeExclusive = () => {
+    const fd = fs.openSync(lockPath, 'wx', 0o600);
+    try {
+      fs.writeSync(fd, JSON.stringify(mine) + '\n');
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
     }
+  };
+  try {
+    writeExclusive();
+    return lockPath;
   } catch (e) {
-    if (e.code === 'workspace_busy') throw e;
+    if (e.code !== 'EEXIST') throw e;
   }
-  fs.writeFileSync(lockPath + '.tmp', JSON.stringify(mine) + '\n');
-  fs.renameSync(lockPath + '.tmp', lockPath);
+  let old = null;
+  try { old = JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch {}
+  const stale = !old || !pidAlive(old.pid) || (Date.now() - Date.parse(old.at) > CFG.lockTtlMs);
+  if (!stale) {
+    throw new HarnessError('workspace_busy',
+      'Another harness run owns this workspace (pid ' + (old.pid || '?') + ', run ' + (old.runId || '?') + ').');
+  }
+  try { fs.unlinkSync(lockPath); } catch {}
+  try {
+    writeExclusive();
+  } catch (e) {
+    if (e.code === 'EEXIST') {
+      throw new HarnessError('workspace_busy', 'Another harness run acquired the workspace lock.');
+    }
+    throw e;
+  }
   return lockPath;
 }
 
@@ -665,6 +686,7 @@ function newState(goal) {
       verifyMs: 0,
       reviewMs: 0,
     },
+    context: contextLedger.create(),
   };
 }
 
@@ -800,6 +822,7 @@ function migrateSession(raw) {
   }
   s.metrics.startedAt = Number(s.metrics.startedAt) || Date.now();
   s.light = s.light !== false;
+  contextLedger.ensure(s);
   return s;
 }
 
@@ -820,6 +843,7 @@ function terminalResult(status, fields = {}) {
     verification,
     review: fields.review || (state && state.review) || { status: 'skipped', findings: [] },
     metrics: fields.metrics || (state && state.metrics) || null,
+    context: fields.context || (state ? contextLedger.summary(state) : null),
     artifactPaths: Array.isArray(fields.artifactPaths) ? fields.artifactPaths : [runDir()],
   };
 }
@@ -2651,9 +2675,14 @@ function checkPolicy(script) {
 
 const TOOL_NAMES = new Set([
   'repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol',
-  'repo.references', 'repo.apply_patch', 'repo.rollback', 'tool.batch',
+  'repo.references', 'repo.graph', 'repo.impact', 'repo.tests',
+  'repo.apply_patch', 'repo.rollback', 'tool.batch',
+  'workspace.diagnostics', 'workspace.test',
 ]);
-const READ_TOOLS = new Set(['repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol', 'repo.references']);
+const READ_TOOLS = new Set([
+  'repo.search', 'repo.read', 'repo.list', 'repo.map', 'repo.symbol',
+  'repo.references', 'repo.graph', 'repo.impact', 'repo.tests',
+]);
 
 /* ------------------------------------------------------------------- exec */
 
@@ -2683,21 +2712,39 @@ async function executeToolAction(action, turn) {
     workspace: CFG.workdir,
   });
 
-  const denied = (reason, code = 125) => {
+  const denied = (reason, code = 125, errorCode = 'policy_denied') => {
     const msg = 'TOOL DENIED: ' + reason;
-    fs.writeFileSync(path.join(turnDir, 'tool-result.json'), JSON.stringify({ ok: false, code: 'policy_denied', error: reason }, null, 2));
-    emitEvent('action.finished', { kind: 'tool', tool, turn, actionId, exit: code, denied: true, reason });
+    fs.writeFileSync(path.join(turnDir, 'tool-result.json'), JSON.stringify({ ok: false, code: errorCode, error: reason }, null, 2));
+    emitEvent('action.finished', { kind: 'tool', tool, turn, actionId, exit: code, denied: true, reason, code: errorCode });
     return { exit: code, output: msg, durationMs: 0, bytes: msg.length, runDir: turnDir, denied: true };
   };
 
   if (!TOOL_NAMES.has(tool)) {
-    return denied('unknown tool: ' + tool + ' (allowed: ' + [...TOOL_NAMES].join(', ') + ')', 126);
+    return denied('unknown tool: ' + tool + ' (allowed: ' + [...TOOL_NAMES].join(', ') + ')', 126, 'invalid_args');
   }
-  if (CFG.mode === 'preview') return denied('preview mode does not execute tools');
-  const writeTool = tool === 'repo.apply_patch' || tool === 'repo.rollback';
-  if (writeTool && CFG.mode === 'readonly') return denied('read-only mode');
-
-  if (writeTool && CFG.mode === 'ask') {
+  const target = String(args.path || (Array.isArray(args.changes) && args.changes[0] && args.changes[0].path)
+    || (Array.isArray(args.paths) && args.paths[0]) || '');
+  const decision = policy.decide({
+    mode: CFG.mode,
+    tool,
+    workspace: CFG.workdir,
+    target,
+  });
+  policy.audit(CFG.workdir, {
+    runId: CFG.runId,
+    actionId,
+    tool,
+    capability: policy.TOOL_CAPS[tool] || null,
+    decision: decision.decision,
+    reason: decision.reason,
+    target,
+    revision: state.verification ? state.verification.revision : null,
+  });
+  if (decision.decision === 'deny') {
+    const exitCode = decision.code === 'policy_unavailable' ? 126 : 125;
+    return denied(decision.reason, exitCode, decision.code);
+  }
+  if (decision.decision === 'approval_required') {
     const approval = await requestApproval('tool', { tool, args }, actionId);
     if (!approval.approve) return denied('user denied: ' + (approval.reason || 'no reason'));
   }
@@ -2719,6 +2766,12 @@ async function executeToolAction(action, turn) {
   const durationMs = Date.now() - started;
   if (result && result.ok && tool === 'repo.read' && result.data) {
     addReadRange(result.data.path, result.data.from, result.data.to);
+  }
+  if (result && result.ok && (tool === 'repo.apply_patch' || tool === 'repo.rollback')) {
+    const changed = (result.data && (result.data.changes || result.data.files)) || [];
+    const paths = changed.map((c) => typeof c === 'string' ? c : c.path).filter(Boolean);
+    contextLedger.invalidate(state, paths);
+    for (const rel of paths) delete state.reads[rel];
   }
   const output = 'TOOL ' + tool + (result.ok ? ' ok' : ' error [' + result.code + ']') + '\n'
     + clampMiddle(JSON.stringify(result, null, 2), 24000);
@@ -3169,7 +3222,8 @@ function buildLightPrompt() {
   p.push('- Local tools (no shell): reply with one JSON object in the block:');
   p.push('  {"version":1,"tool":"repo.search","args":{"query":"resume session","limit":5}}');
   p.push('  Also: repo.read, repo.list, repo.map, repo.symbol, repo.references,');
-  p.push('  repo.apply_patch, repo.rollback, tool.batch. Read before editing.');
+  p.push('  repo.graph, repo.impact, repo.tests, repo.apply_patch, repo.rollback, tool.batch.');
+  p.push('  Read current source before editing; include expectedDigest when patching.');
   if (!CFG.noAttach && !CFG.perRun) {
     p.push('- Upload a workspace file: first line ATTACH, then {"file":"relative/path"}.');
   }
@@ -3240,7 +3294,8 @@ function buildPrompt() {
   p.push('- To search/read the repo, reply with ONE fenced block containing one JSON object:');
   p.push('  {"version":1,"tool":"repo.search","args":{"query":"resume session","strategy":"auto","limit":5}}');
   p.push('- Tools: repo.search, repo.read, repo.list, repo.map, repo.symbol,');
-  p.push('  repo.references, repo.apply_patch, repo.rollback, tool.batch.');
+  p.push('  repo.references, repo.graph, repo.impact, repo.tests,');
+  p.push('  repo.apply_patch, repo.rollback, tool.batch.');
   p.push('- repo.read args: {"path":"src/a.js","from":1,"to":80,"expectedDigest":"sha256:..."}');
   p.push('- repo.apply_patch args: {"changes":[{"path":"src/a.js","find":"old","replace":"new",');
   p.push('  "expectedDigest":"sha256:..."}]}. Read the file first and include its digest.');
@@ -3893,6 +3948,7 @@ async function runGoal(page, goal, opts = {}) {
     // (already bounded) plan/notes, which are re-injected from disk.
     if (CFG.perRun && !CFG.mock && state.turn > 0 && state.turn !== lastFreshTurn) {
       await resetChat(page);
+      contextLedger.newEpoch(state);
       lastFreshTurn = state.turn;
     }
     let text = String(promptText);
@@ -3905,6 +3961,11 @@ async function runGoal(page, goal, opts = {}) {
     state.metrics.sends = (state.metrics.sends || 0) + 1;
     state.metrics.promptBytes = (state.metrics.promptBytes || 0) + Buffer.byteLength(text);
     state.metrics.promptChars = (state.metrics.promptChars || 0) + text.length;
+    contextLedger.record(state, 'goal', 'goal', state.goal, state.turn);
+    if (state.plan) contextLedger.record(state, 'plan', 'memory', state.plan, state.turn);
+    if (state.notes) contextLedger.record(state, 'notes', 'memory', state.notes, state.turn);
+    if (state.last) contextLedger.record(state, 'last', 'observation', formatObservation(state.last), state.turn);
+    contextLedger.record(state, 'skills', 'skills', skillsPromptBlock(), state.turn);
     const b = await sendPrompt(page, text);
     sendMs = Date.now() - t0;
     emitEvent('provider.waiting', { turn: state.turn + 1, promptChars });
@@ -3989,6 +4050,7 @@ async function runGoal(page, goal, opts = {}) {
       verification: final.verification,
       review: final.review,
       metrics: final.metrics,
+      context: final.context,
       artifactPaths: final.artifactPaths,
     });
     return final;
@@ -4527,6 +4589,7 @@ async function runGoal(page, goal, opts = {}) {
         await resetChat(page);
         const ready = await firstVisible(page, SEL.composer, 30000);
         if (!ready) throw new HarnessError('compact_failed', 'New chat did not open a composer; auto-compact aborted safely.');
+        contextLedger.newEpoch(state);
         lastFreshTurn = state.turn;
         emitPhase('preparing', { turn: state.turn, reason: 'compact complete' });
       }
@@ -4691,6 +4754,7 @@ async function runGoal(page, goal, opts = {}) {
       if (!ready) {
         throw new HarnessError('compact_failed', 'New chat did not open a composer; auto-compact aborted safely.');
       }
+      contextLedger.newEpoch(state);
       lastFreshTurn = state.turn;
       log('__HARNESS_COMPACT__' + JSON.stringify({
         phase: 'done',
@@ -5538,6 +5602,10 @@ async function main() {
 
     log('NEW CHAT: starting a fresh Copilot conversation');
     await resetChat(page);
+    if (state) {
+      contextLedger.newEpoch(state);
+      saveState();
+    }
     log('__HARNESS_COMPACT__' + JSON.stringify({ phase: 'done', chars, manual: true }));
     log('NEW CHAT OK' + (chars ? ' · handoff saved (' + chars + ' chars)' : ''));
     await finishRun(browser);
