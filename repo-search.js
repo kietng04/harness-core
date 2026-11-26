@@ -247,6 +247,147 @@ function saveCache(root, cache) {
   } catch {}
 }
 
+/* ---------------------------------------------------- trigram instant grep */
+
+const TRIGRAM_VERSION = 1;
+const TRIGRAM_FILE = 'trigram-v1.json';
+let trigramRuntime = null;
+
+function trigramPath(root) {
+  return path.join(canonicalRoot(root), ...CACHE_DIR, TRIGRAM_FILE);
+}
+
+function resetTrigramCache() {
+  trigramRuntime = null;
+}
+
+function trigramsOf(text) {
+  const out = new Set();
+  const s = String(text || '').toLowerCase();
+  for (let i = 0; i + 2 < s.length; i++) out.add(s.slice(i, i + 3));
+  return out;
+}
+
+function loadTrigram(root) {
+  if (trigramRuntime && trigramRuntime.workspace === canonicalRoot(root)) return trigramRuntime;
+  try {
+    const data = JSON.parse(fs.readFileSync(trigramPath(root), 'utf8'));
+    if (data && data.version === TRIGRAM_VERSION && data.workspace === canonicalRoot(root)) {
+      data.files = data.files || {};
+      data.postings = data.postings || {};
+      trigramRuntime = data;
+      return data;
+    }
+  } catch {}
+  trigramRuntime = {
+    version: TRIGRAM_VERSION,
+    workspace: canonicalRoot(root),
+    files: {},
+    postings: {},
+    complete: false,
+    builtAt: 0,
+  };
+  return trigramRuntime;
+}
+
+function addPostings(index, rel, trigrams) {
+  for (const tri of trigrams) {
+    if (!index.postings[tri]) index.postings[tri] = [];
+    if (!index.postings[tri].includes(rel)) index.postings[tri].push(rel);
+  }
+}
+
+function removePostings(index, rel, trigrams) {
+  for (const tri of trigrams || []) {
+    const list = index.postings[tri];
+    if (!list) continue;
+    index.postings[tri] = list.filter((r) => r !== rel);
+    if (!index.postings[tri].length) delete index.postings[tri];
+  }
+}
+
+function saveTrigram(root, index) {
+  try {
+    fs.mkdirSync(path.dirname(trigramPath(root)), { recursive: true });
+    const tmp = trigramPath(root) + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(index));
+    fs.renameSync(tmp, trigramPath(root));
+  } catch {}
+}
+
+function ensureTrigramIndex(root, options = {}) {
+  root = canonicalRoot(root);
+  const started = Date.now();
+  const maxMs = Math.max(50, Number(options.maxMs) || 3000);
+  const index = loadTrigram(root);
+  const files = walk(root, ['.']);
+  const seen = new Set();
+  let updated = 0;
+  let complete = true;
+  for (const file of files) {
+    if (Date.now() - started > maxMs) { complete = false; break; }
+    let st;
+    try { st = fs.statSync(file.abs); } catch { continue; }
+    const prev = index.files[file.rel];
+    seen.add(file.rel);
+    if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size && Array.isArray(prev.trigrams)) continue;
+    const text = readText(file.abs);
+    if (text == null) {
+      if (prev) { removePostings(index, file.rel, prev.trigrams); delete index.files[file.rel]; updated++; }
+      continue;
+    }
+    if (prev) removePostings(index, file.rel, prev.trigrams);
+    const trigrams = [...trigramsOf(text)];
+    index.files[file.rel] = {
+      mtimeMs: st.mtimeMs,
+      size: st.size,
+      digest: sha256(text),
+      trigrams,
+    };
+    addPostings(index, file.rel, trigrams);
+    updated++;
+  }
+  for (const rel of Object.keys(index.files)) {
+    if (!seen.has(rel)) {
+      removePostings(index, rel, index.files[rel].trigrams);
+      delete index.files[rel];
+      updated++;
+    }
+  }
+  index.complete = complete;
+  index.builtAt = index.builtAt || Date.now();
+  if (updated || !index.builtAt) saveTrigram(root, index);
+  return {
+    index,
+    complete,
+    files: Object.keys(index.files).length,
+    updated,
+    durationMs: Date.now() - started,
+  };
+}
+
+function trigramCandidates(index, query, limitFiles = 2000) {
+  const q = String(query || '').toLowerCase();
+  if (q.length < 3) return null;
+  const tris = [...trigramsOf(q)];
+  if (!tris.length) return null;
+  tris.sort((a, b) => (index.postings[a] || []).length - (index.postings[b] || []).length);
+  let intersection = null;
+  for (const tri of tris) {
+    const list = index.postings[tri];
+    if (!list) return [];
+    if (!intersection) {
+      intersection = new Set(list);
+    } else {
+      intersection = new Set(list.filter((rel) => intersection.has(rel)));
+    }
+    if (!intersection.size) return [];
+    if (intersection.size > limitFiles) return null;
+  }
+  return intersection ? [...intersection] : null;
+}
+
+
 function buildCache(root, scope, options = {}) {
   const started = Date.now();
   const deadline = started + (options.buildTimeoutMs || 5000);
@@ -517,16 +658,63 @@ function hydrateHits(root, hits, args) {
   return hits;
 }
 
-function searchPatternSync(root, args) {
+function preparePattern(root, args) {
   const allowedFiles = walk(root, args.scope || ['.']);
   const allowed = new Set(allowedFiles.map((f) => f.rel));
+  let candidates = null;
+  let indexMeta = null;
+  if (args.match === 'literal' && String(args.query || '').length >= 3 && args.instant !== false) {
+    try {
+      const built = ensureTrigramIndex(root, { maxMs: Number(args.indexMaxMs) || 3000 });
+      if (built.complete) {
+        const found = trigramCandidates(built.index, args.query);
+        if (found !== null) {
+          candidates = found.filter((rel) => allowed.has(rel));
+          indexMeta = {
+            used: true,
+            files: built.files,
+            updated: built.updated,
+            candidates: candidates.length,
+            durationMs: built.durationMs,
+          };
+        }
+      } else {
+        indexMeta = {
+          used: false,
+          fallback: 'index incomplete',
+          files: built.files,
+          updated: built.updated,
+        };
+      }
+    } catch (e) {
+      indexMeta = { used: false, fallback: e.message };
+    }
+  }
+  return { allowed, candidates, indexMeta };
+}
+
+function searchPatternSync(root, args) {
+  const { allowed, candidates, indexMeta } = preparePattern(root, args);
+  const scanSet = candidates !== null ? new Set(candidates) : allowed;
+  if (candidates !== null && candidates.length === 0) {
+    return {
+      ok: true,
+      data: {
+        query: String(args.query), match: args.match, backend: 'index',
+        hits: [], truncated: false, scanned: 0, index: indexMeta,
+      },
+    };
+  }
   if (args.backend === 'node' || !rgAvailable()) {
-    return nodePatternScan(root, args, allowed, null);
+    const result = nodePatternScan(root, args, scanSet, null);
+    if (result.ok) result.data.index = indexMeta;
+    return result;
   }
   const matcher = makeMatcher(args);
   if (matcher.error) return { ok: false, code: 'invalid_args', error: matcher.error };
   const limit = patternLimit(args);
-  const rgArgs = ['-n', '--column', '--no-heading', '--color', 'never', '--no-messages', ...matcher.flags, ...matcher.rg, '.'];
+  const targets = candidates !== null ? candidates : ['.'];
+  const rgArgs = ['-n', '--column', '--no-heading', '--color', 'never', '--no-messages', '-H', ...matcher.flags, ...matcher.rg, ...targets];
   const started = Date.now();
   const r = spawnSync('rg', rgArgs, {
     cwd: root,
@@ -535,7 +723,9 @@ function searchPatternSync(root, args) {
     maxBuffer: 8 * 1024 * 1024,
   });
   if (r.error && r.error.code === 'ENOENT') {
-    return nodePatternScan(root, args, allowed, null);
+    const result = nodePatternScan(root, args, scanSet, null);
+    if (result.ok) result.data.index = indexMeta;
+    return result;
   }
   if (r.error && r.error.code === 'ETIMEDOUT') {
     return { ok: false, code: 'timeout', error: 'search timed out' };
@@ -552,22 +742,35 @@ function searchPatternSync(root, args) {
       backend: 'rg',
       hits: hydrateHits(root, parsed.hits, args),
       truncated: parsed.truncated,
-      scanned: allowed.size,
+      scanned: scanSet.size,
+      index: indexMeta,
       durationMs: Date.now() - started,
     },
   };
 }
 
 async function searchPatternAsync(root, args, opts = {}) {
-  const allowedFiles = walk(root, args.scope || ['.']);
-  const allowed = new Set(allowedFiles.map((f) => f.rel));
+  const { allowed, candidates, indexMeta } = preparePattern(root, args);
+  const scanSet = candidates !== null ? new Set(candidates) : allowed;
+  if (candidates !== null && candidates.length === 0) {
+    return {
+      ok: true,
+      data: {
+        query: String(args.query), match: args.match, backend: 'index',
+        hits: [], truncated: false, scanned: 0, index: indexMeta,
+      },
+    };
+  }
   if (args.backend === 'node' || !rgAvailable()) {
-    return nodePatternScan(root, args, allowed, opts.signal);
+    const result = nodePatternScan(root, args, scanSet, opts.signal);
+    if (result.ok) result.data.index = indexMeta;
+    return result;
   }
   const matcher = makeMatcher(args);
   if (matcher.error) return { ok: false, code: 'invalid_args', error: matcher.error };
   const limit = patternLimit(args);
-  const rgArgs = ['-n', '--column', '--no-heading', '--color', 'never', '--no-messages', ...matcher.flags, ...matcher.rg, '.'];
+  const targets = candidates !== null ? candidates : ['.'];
+  const rgArgs = ['-n', '--column', '--no-heading', '--color', 'never', '--no-messages', '-H', ...matcher.flags, ...matcher.rg, ...targets];
   return await new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
@@ -585,7 +788,9 @@ async function searchPatternAsync(root, args, opts = {}) {
         signal: opts.signal,
       });
     } catch (e) {
-      finish(nodePatternScan(root, args, allowed, opts.signal));
+      const fallback = nodePatternScan(root, args, scanSet, opts.signal);
+      if (fallback.ok) fallback.data.index = indexMeta;
+      finish(fallback);
       return;
     }
     const timer = setTimeout(() => {
@@ -605,7 +810,11 @@ async function searchPatternAsync(root, args, opts = {}) {
     child.on('error', (e) => {
       clearTimeout(timer);
       if (opts.signal && opts.signal.aborted) finish({ ok: false, code: 'cancelled', error: 'cancelled' });
-      else finish(nodePatternScan(root, args, allowed, opts.signal));
+      else {
+        const fallback = nodePatternScan(root, args, scanSet, opts.signal);
+        if (fallback.ok) fallback.data.index = indexMeta;
+        finish(fallback);
+      }
     });
     child.on('close', (code) => {
       clearTimeout(timer);
@@ -626,7 +835,8 @@ async function searchPatternAsync(root, args, opts = {}) {
           backend: 'rg',
           hits: hydrateHits(root, parsed.hits, args),
           truncated: parsed.truncated,
-          scanned: allowed.size,
+          scanned: scanSet.size,
+          index: indexMeta,
         },
       });
     });
@@ -669,7 +879,7 @@ async function searchPatternGroupAsync(root, args, opts = {}) {
 
   if (args.backend !== 'node' && rgAvailable()) {
     backend = 'rg';
-    const rgArgs = ['-n', '--column', '--no-heading', '--color', 'never', '--no-messages', '-F'];
+    const rgArgs = ['-n', '--column', '--no-heading', '--color', 'never', '--no-messages', '-H', '-F'];
     if (!caseSensitive) rgArgs.push('-i');
     for (const q of queries) rgArgs.push('-e', String(q.query));
     rgArgs.push('.');
@@ -824,8 +1034,12 @@ module.exports = {
   search,
   searchPatternAsync,
   searchPatternGroupAsync,
+  ensureTrigramIndex,
+  trigramCandidates,
   read,
   list,
   walk,
   cachePath,
+  trigramPath,
+  resetTrigramCache,
 };

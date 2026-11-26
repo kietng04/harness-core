@@ -310,6 +310,9 @@ node agent.js --search "khôi phục phiên"
 - Tokenizer tách `camelCase`, `snake_case`, `kebab-case`, Unicode.
 - BM25 + exact path/symbol boost + synonym Việt–Anh.
 - Index cache `.harness/index/repo-search-v1.json`, incremental theo mtime/size.
+- Instant grep literal ≥3 ký tự dùng trigram index
+  `.harness/index/trigram-v1.json`: chọn candidate file trước, `rg`/Node xác
+  nhận nội dung hiện tại, fallback scan khi index lỗi/thiếu/cold.
 - Skip `.git`, `.harness`, `node_modules`, binary, file quá lớn, symlink escape.
 - `repo.read` trả digest và range hiện tại trước khi sửa.
 

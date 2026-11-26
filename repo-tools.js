@@ -412,6 +412,8 @@ function applyPatch(workspace, args = {}, actionId, opts = {}) {
     journal.written = written;
     fs.writeFileSync(journalFile, JSON.stringify(journal, null, 2));
     try { fs.rmSync(search.cachePath(workspace), { force: true }); } catch {}
+  try { fs.rmSync(search.trigramPath(workspace), { force: true }); } catch {}
+    try { fs.rmSync(search.trigramPath(workspace), { force: true }); } catch {}
     return {
       ok: false,
       code: 'tool_error',
@@ -420,6 +422,8 @@ function applyPatch(workspace, args = {}, actionId, opts = {}) {
     };
   }
   try { fs.rmSync(search.cachePath(workspace), { force: true }); } catch {}
+  try { fs.rmSync(search.trigramPath(workspace), { force: true }); } catch {}
+    try { fs.rmSync(search.trigramPath(workspace), { force: true }); } catch {}
   return {
     ok: true,
     data: {
@@ -485,6 +489,8 @@ function rollback(workspace, args = {}, actionId) {
   const outFile = path.join(workspace, '.harness', 'journal', 'rollback-' + String(actionId || Date.now()) + '.json');
   fs.writeFileSync(outFile, JSON.stringify(out, null, 2));
   try { fs.rmSync(search.cachePath(workspace), { force: true }); } catch {}
+  try { fs.rmSync(search.trigramPath(workspace), { force: true }); } catch {}
+    try { fs.rmSync(search.trigramPath(workspace), { force: true }); } catch {}
   return { ok: true, data: { journal: toPosix(path.relative(workspace, outFile)), files: out.files } };
 }
 

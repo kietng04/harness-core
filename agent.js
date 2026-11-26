@@ -5705,7 +5705,15 @@ async function main() {
 
   if (flags.has('--index')) {
     const result = repoSearch.search(CFG.workdir, { query: 'index', limit: 1, buildTimeoutMs: 15000 });
-    const info = result.ok ? result.data.index : { error: result.error };
+    const info = result.ok ? { ...result.data.index } : { error: result.error };
+    const tri = repoSearch.ensureTrigramIndex(CFG.workdir, { maxMs: 15000 });
+    info.trigram = {
+      files: tri.files,
+      updated: tri.updated,
+      complete: tri.complete,
+      durationMs: tri.durationMs,
+      path: repoSearch.trigramPath(CFG.workdir),
+    };
     process.stdout.write(JSON.stringify(info, null, 2) + '\n');
     return;
   }
