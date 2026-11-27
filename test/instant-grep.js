@@ -9,7 +9,9 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const search = require('../repo-search');
+const AGENT = path.join(__dirname, '..', 'agent.js');
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -97,6 +99,14 @@ try {
   const indexSize = fs.existsSync(search.trigramPath(root)) ? fs.statSync(search.trigramPath(root)).size : 0;
   check('index persisted', indexSize > 100, true);
   console.log('  instant grep p50=' + p50 + 'ms indexBytes=' + indexSize);
+
+  const cli = spawnSync(process.execPath, [AGENT, '--grep', 'instant-grep-token', '--workdir', root], {
+    cwd: path.join(__dirname, '..'),
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  check('cli grep exit', cli.status, 0);
+  check('cli grep hit', /src\/a\.js:\d+:\d+:/.test(cli.stdout), true);
 
   if (failures) {
     console.error('\nINSTANT GREP FAILED: ' + failures + ' assertion(s)');

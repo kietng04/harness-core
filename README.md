@@ -310,9 +310,11 @@ node agent.js --search "khôi phục phiên"
 - Tokenizer tách `camelCase`, `snake_case`, `kebab-case`, Unicode.
 - BM25 + exact path/symbol boost + synonym Việt–Anh.
 - Index cache `.harness/index/repo-search-v1.json`, incremental theo mtime/size.
-- Instant grep literal ≥3 ký tự dùng trigram index
-  `.harness/index/trigram-v1.json`: chọn candidate file trước, `rg`/Node xác
+- Instant grep literal ≥3 ký tự dùng Bloom trigram index
+  `.harness/index/trigram-v2.json`: chọn candidate file trước, `rg`/Node xác
   nhận nội dung hiện tại, fallback scan khi index lỗi/thiếu/cold.
+- Node scanner đọc file dạng `Buffer`, `indexOf` byte-level, fold ASCII một lần;
+  không cần cài ripgrep.
 - Skip `.git`, `.harness`, `node_modules`, binary, file quá lớn, symlink escape.
 - `repo.read` trả digest và range hiện tại trước khi sửa.
 
@@ -419,6 +421,7 @@ node agent.js --probe                   # kiểm tra selector trên page thật
 node agent.js --prompt "goal"           # in prompt đầu, không mở browser
 node agent.js --context                # repo instructions + plan + git
 node agent.js --search "khôi phục phiên" # local BM25 search
+node agent.js --grep "restoreCheckpoint"  # instant literal grep (trigram)
 node agent.js --index                  # build/update search index
 node agent.js --selftest               # unit tests
 node agent.js --mock                   # E2E bằng mock Copilot + headless Edge

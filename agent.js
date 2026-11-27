@@ -5519,6 +5519,7 @@ function usage() {
     '  node agent.js --prompt "goal"        print the first prompt, no browser',
     '  node agent.js --context              show repo instructions + memory + git',
     '  node agent.js --search "query"      local BM25 repo search (no network)',
+    '  node agent.js --grep "literal"      instant literal grep (trigram index)',
     '  node agent.js --index                build/update the local search index',
     '  node agent.js --selftest             run unit tests (no browser)',
     '  node agent.js --mock                 local end-to-end test (headless Edge)',
@@ -5546,7 +5547,7 @@ function usage() {
 
 const VALUE_FLAGS = new Set([
   '--session', '--cdp', '--chat-url', '--max-turns', '--max-total-ms',
-  '--max-turn-ms', '--profile', '--workdir', '--auto-compact', '--verify', '--lang', '--search',
+  '--max-turn-ms', '--profile', '--workdir', '--auto-compact', '--verify', '--lang', '--search', '--grep',
 ]);
 
 function parseArgv(argv) {
@@ -5726,6 +5727,27 @@ async function main() {
     });
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
     if (!result.ok) process.exitCode = 2;
+    return;
+  }
+
+  if (values['--grep']) {
+    const result = repoSearch.search(CFG.workdir, {
+      query: values['--grep'],
+      match: 'literal',
+      limit: 20,
+      instant: true,
+    });
+    if (!result.ok) {
+      process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+      process.exitCode = 2;
+      return;
+    }
+    for (const hit of result.data.hits) {
+      process.stdout.write(hit.path + ':' + hit.line + ':' + hit.column + ': ' + hit.matchText + '\n');
+    }
+    process.stdout.write('# ' + result.data.hits.length + ' hit(s) · backend='
+      + result.data.backend + ' · index=' + (result.data.index && result.data.index.used ? 'used' : 'fallback')
+      + ' · ' + (result.data.durationMs || result.data.index && result.data.index.durationMs || 0) + 'ms\n');
     return;
   }
 

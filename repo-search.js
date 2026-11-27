@@ -185,19 +185,17 @@ function walk(root, scope, depthLimit = 12) {
         if (!matcher.hasNegations() && matcher.ignores(relDir, true)) continue;
         visit(full, depth + 1);
       } else if (entry.isFile()) {
+        // Directory recursion never follows symlinks and the root itself was
+        // realpath-resolved, so a regular file here cannot escape the root.
+        // Avoid realpathSync per file: it dominates walk time on large trees.
         const rel = toPosix(path.relative(root, full));
         if (SKIP_RE.test(rel) || matcher.ignores(rel, false)) continue;
-        let real;
-        try { real = fs.realpathSync(full); } catch { continue; }
-        if (!isInside(root, real)) continue;
-        const realRel = toPosix(path.relative(root, real));
-        if (SKIP_RE.test(realRel) || matcher.ignores(realRel, false)) continue;
         const ext = path.extname(entry.name).toLowerCase();
         if (ext && !TEXT_EXT.has(ext) && entry.name !== 'Makefile' && entry.name !== 'Dockerfile') continue;
         const key = rel;
         if (seen.has(key)) continue;
         seen.add(key);
-        files.push({ rel, abs: real });
+        files.push({ rel, abs: full });
       }
     }
   };
@@ -215,14 +213,21 @@ function walk(root, scope, depthLimit = 12) {
   return files;
 }
 
+const MAX_TEXT_BYTES = 512 * 1024;
+
 function readText(abs) {
+  const buf = readBuffer(abs);
+  return buf == null ? null : buf.toString('utf8');
+}
+
+function readBuffer(abs) {
   let st;
   try { st = fs.statSync(abs); } catch { return null; }
-  if (st.size > 512 * 1024) return null;
+  if (st.size > MAX_TEXT_BYTES) return null;
   let buf;
   try { buf = fs.readFileSync(abs); } catch { return null; }
   if (buf.includes(0)) return null;
-  return buf.toString('utf8');
+  return buf;
 }
 
 function cachePath(root) {
@@ -249,8 +254,13 @@ function saveCache(root, cache) {
 
 /* ---------------------------------------------------- trigram instant grep */
 
-const TRIGRAM_VERSION = 1;
-const TRIGRAM_FILE = 'trigram-v1.json';
+const TRIGRAM_VERSION = 2;
+const TRIGRAM_FILE = 'trigram-v2.json';
+const BLOOM_BYTES = 512;
+const BLOOM_BITS = BLOOM_BYTES * 8;
+const BLOOM_MASK = BLOOM_BITS - 1;
+const BLOOM_K = 6;
+const BLOOM_MAX_FILE = 128 * 1024;
 let trigramRuntime = null;
 
 function trigramPath(root) {
@@ -261,11 +271,48 @@ function resetTrigramCache() {
   trigramRuntime = null;
 }
 
-function trigramsOf(text) {
-  const out = new Set();
-  const s = String(text || '').toLowerCase();
-  for (let i = 0; i + 2 < s.length; i++) out.add(s.slice(i, i + 3));
-  return out;
+function triHash(a, b, c) {
+  let h = 0x811c9dc5;
+  h = Math.imul(h ^ a, 0x01000193);
+  h = Math.imul(h ^ b, 0x01000193);
+  h = Math.imul(h ^ c, 0x01000193);
+  return h >>> 0;
+}
+
+/*
+ * Bloom filter over byte trigrams (ASCII-folded). No false negatives, so the
+ * confirmation scan stays authoritative; a larger index only means extra files
+ * are scanned. This replaces the old file -> trigram-array + postings JSON,
+ * which grew to roughly the source size and cost 40ms+ to parse.
+ */
+function bloomForBuffer(buf) {
+  const bytes = Buffer.alloc(BLOOM_BYTES);
+  const folded = asciiFoldBuffer(buf);
+  for (let i = 0; i + 2 < folded.length; i++) {
+    const h = triHash(folded[i], folded[i + 1], folded[i + 2]);
+    const h2 = ((h >>> 16) ^ h) | 1;
+    for (let k = 0; k < BLOOM_K; k++) {
+      const bit = (h + Math.imul(k, h2)) & BLOOM_MASK;
+      bytes[bit >> 3] |= 1 << (bit & 7);
+    }
+  }
+  return bytes.toString('base64');
+}
+
+function bloomHas(bytes, h) {
+  const h2 = ((h >>> 16) ^ h) | 1;
+  for (let k = 0; k < BLOOM_K; k++) {
+    const bit = (h + Math.imul(k, h2)) & BLOOM_MASK;
+    if (!(bytes[bit >> 3] & (1 << (bit & 7)))) return false;
+  }
+  return true;
+}
+
+function decodedBloom(entry) {
+  if (entry._bloom) return entry._bloom;
+  const bytes = Buffer.from(entry.bloom || '', 'base64');
+  Object.defineProperty(entry, '_bloom', { value: bytes, enumerable: false, configurable: true });
+  return bytes;
 }
 
 function loadTrigram(root) {
@@ -274,7 +321,6 @@ function loadTrigram(root) {
     const data = JSON.parse(fs.readFileSync(trigramPath(root), 'utf8'));
     if (data && data.version === TRIGRAM_VERSION && data.workspace === canonicalRoot(root)) {
       data.files = data.files || {};
-      data.postings = data.postings || {};
       trigramRuntime = data;
       return data;
     }
@@ -283,27 +329,10 @@ function loadTrigram(root) {
     version: TRIGRAM_VERSION,
     workspace: canonicalRoot(root),
     files: {},
-    postings: {},
     complete: false,
     builtAt: 0,
   };
   return trigramRuntime;
-}
-
-function addPostings(index, rel, trigrams) {
-  for (const tri of trigrams) {
-    if (!index.postings[tri]) index.postings[tri] = [];
-    if (!index.postings[tri].includes(rel)) index.postings[tri].push(rel);
-  }
-}
-
-function removePostings(index, rel, trigrams) {
-  for (const tri of trigrams || []) {
-    const list = index.postings[tri];
-    if (!list) continue;
-    index.postings[tri] = list.filter((r) => r !== rel);
-    if (!index.postings[tri].length) delete index.postings[tri];
-  }
 }
 
 function saveTrigram(root, index) {
@@ -330,28 +359,22 @@ function ensureTrigramIndex(root, options = {}) {
     try { st = fs.statSync(file.abs); } catch { continue; }
     const prev = index.files[file.rel];
     seen.add(file.rel);
-    if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size && Array.isArray(prev.trigrams)) continue;
-    const text = readText(file.abs);
-    if (text == null) {
-      if (prev) { removePostings(index, file.rel, prev.trigrams); delete index.files[file.rel]; updated++; }
+    if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size && typeof prev.bloom === 'string') continue;
+    const buf = readBuffer(file.abs);
+    if (buf == null) {
+      if (prev) { delete index.files[file.rel]; updated++; }
       continue;
     }
-    if (prev) removePostings(index, file.rel, prev.trigrams);
-    const trigrams = [...trigramsOf(text)];
     index.files[file.rel] = {
       mtimeMs: st.mtimeMs,
       size: st.size,
-      digest: sha256(text),
-      trigrams,
+      bloom: buf.length > BLOOM_MAX_FILE ? '' : bloomForBuffer(buf),
     };
-    addPostings(index, file.rel, trigrams);
     updated++;
   }
-  for (const rel of Object.keys(index.files)) {
-    if (!seen.has(rel)) {
-      removePostings(index, rel, index.files[rel].trigrams);
-      delete index.files[rel];
-      updated++;
+  if (complete) {
+    for (const rel of Object.keys(index.files)) {
+      if (!seen.has(rel)) { delete index.files[rel]; updated++; }
     }
   }
   index.complete = complete;
@@ -367,24 +390,31 @@ function ensureTrigramIndex(root, options = {}) {
 }
 
 function trigramCandidates(index, query, limitFiles = 2000) {
-  const q = String(query || '').toLowerCase();
+  const q = asciiFoldBuffer(Buffer.from(String(query || ''), 'utf8'));
   if (q.length < 3) return null;
-  const tris = [...trigramsOf(q)];
-  if (!tris.length) return null;
-  tris.sort((a, b) => (index.postings[a] || []).length - (index.postings[b] || []).length);
-  let intersection = null;
-  for (const tri of tris) {
-    const list = index.postings[tri];
-    if (!list) return [];
-    if (!intersection) {
-      intersection = new Set(list);
-    } else {
-      intersection = new Set(list.filter((rel) => intersection.has(rel)));
-    }
-    if (!intersection.size) return [];
-    if (intersection.size > limitFiles) return null;
+  const hashes = [];
+  const seen = new Set();
+  for (let i = 0; i + 2 < q.length; i++) {
+    const h = triHash(q[i], q[i + 1], q[i + 2]);
+    if (seen.has(h)) continue;
+    seen.add(h);
+    hashes.push(h);
   }
-  return intersection ? [...intersection] : null;
+  if (!hashes.length) return null;
+  const out = [];
+  for (const rel of Object.keys(index.files)) {
+    const entry = index.files[rel];
+    if (entry.bloom === '') { out.push(rel); continue; }
+    if (entry.bloom == null) { out.push(rel); continue; }
+    const bloom = decodedBloom(entry);
+    let match = true;
+    for (const h of hashes) {
+      if (!bloomHas(bloom, h)) { match = false; break; }
+    }
+    if (match) out.push(rel);
+    if (out.length > limitFiles) return null;
+  }
+  return out;
 }
 
 
@@ -560,7 +590,246 @@ function hitFromLine(rel, lines, index, matchIndex, column, reason) {
   };
 }
 
-function nodePatternScan(root, args, allowed, signal) {
+const NL_BYTE = 0x0a;
+
+function isAsciiText(text) {
+  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 0x7f) return false;
+  return true;
+}
+
+function hasNonAsciiBytes(buf) {
+  for (let i = 0; i < buf.length; i++) if (buf[i] >= 0x80) return true;
+  return false;
+}
+
+/*
+ * Byte-level ASCII case folding. Latin-1 maps bytes 1:1 and only A-Z change;
+ * every non-ASCII byte stays >= 0x80, so UTF-8 sequences keep their offsets
+ * and can never be hit by an ASCII needle.
+ */
+function asciiFoldBuffer(buf) {
+  return Buffer.from(buf.toString('latin1').toLowerCase(), 'latin1');
+}
+
+function bufferLineBounds(buf, idx) {
+  const lineStart = idx === 0 ? 0 : buf.lastIndexOf(NL_BYTE, idx - 1) + 1;
+  const nl = buf.indexOf(NL_BYTE, idx);
+  const lineEnd = nl === -1 ? buf.length : nl;
+  return { lineStart, lineEnd };
+}
+
+function byteColumn(buf, lineStart, idx) {
+  const prefix = buf.subarray(lineStart, idx);
+  const col = hasNonAsciiBytes(prefix) ? prefix.toString('utf8').length : prefix.length;
+  return col + 1;
+}
+
+function bufferSnippet(buf, lineStart, lineEnd, maxLen = 1200) {
+  const start = lineStart < 2 ? 0 : buf.lastIndexOf(NL_BYTE, lineStart - 2) + 1;
+  let end = lineEnd;
+  if (end < buf.length) {
+    const nextNl = buf.indexOf(NL_BYTE, end + 1);
+    end = nextNl === -1 ? buf.length : nextNl;
+  }
+  return buf.subarray(start, end).toString('utf8').slice(0, maxLen);
+}
+
+function countOccurrences(hay, needle, start, end) {
+  let count = 0;
+  let at = start;
+  const step = needle.length || 1;
+  while (at < end) {
+    at = hay.indexOf(needle, at);
+    if (at === -1 || at >= end) break;
+    count++;
+    at += step;
+  }
+  return count;
+}
+
+/*
+ * One file, one query, one pass. `displayBuf` keeps original bytes for text;
+ * `hay` may be ASCII-folded (same length, same offsets) for case-insensitive.
+ */
+function scanLiteralBuffer(displayBuf, hay, needle, rel, limit, lineSnippet = false) {
+  const hits = [];
+  let truncated = false;
+  let lineNo = 1;
+  let lastNl = -1;
+  let nlScan = 0;
+  let from = 0;
+  while (from <= hay.length) {
+    const idx = hay.indexOf(needle, from);
+    if (idx === -1) break;
+    while (true) {
+      const nl = hay.indexOf(NL_BYTE, nlScan);
+      if (nl === -1 || nl >= idx) break;
+      lineNo++;
+      lastNl = nl;
+      nlScan = nl + 1;
+    }
+    if (hits.length >= limit) { truncated = true; break; }
+    const { lineStart, lineEnd } = bufferLineBounds(displayBuf, idx);
+    const lineText = displayBuf.subarray(lineStart, lineEnd).toString('utf8');
+    hits.push({
+      path: rel,
+      from: lineNo,
+      to: lineNo,
+      line: lineNo,
+      column: byteColumn(displayBuf, lineStart, idx),
+      symbol: '',
+      score: 10,
+      reason: lineSnippet ? 'literal match (grouped)' : 'literal match',
+      snippet: lineSnippet ? lineText.trim().slice(0, 1200) : bufferSnippet(displayBuf, lineStart, lineEnd),
+      matchText: lineText.trim().slice(0, 300),
+      matchCount: countOccurrences(hay, needle, lineStart, lineEnd) || 1,
+      matchIndex: idx,
+    });
+    // Match rg/legacy behavior: one hit per line, count all occurrences in it.
+    from = lineEnd < hay.length ? lineEnd + 1 : hay.length + 1;
+  }
+  return { hits, truncated };
+}
+
+function nodeLiteralScanFast(root, args, allowed, signal) {
+  const query = String(args.query || '');
+  const caseSensitive = args.caseSensitive === true;
+  const limit = patternLimit(args);
+  const fold = !caseSensitive && /[A-Za-z]/.test(query);
+  const needle = fold ? Buffer.from(query.toLowerCase(), 'utf8') : Buffer.from(query, 'utf8');
+  const hits = [];
+  let scanned = 0;
+  let truncated = false;
+  for (const rel of allowed) {
+    if (signal && signal.aborted) return { ok: false, code: 'cancelled', error: 'cancelled' };
+    if (hits.length >= limit) {
+      // One more match anywhere means the result is truncated; no need to
+      // build another hit object.
+      let bufProbe;
+      try { bufProbe = readBuffer(path.join(root, rel)); } catch { continue; }
+      if (bufProbe == null) continue;
+      scanned++;
+      const hayProbe = fold ? asciiFoldBuffer(bufProbe) : bufProbe;
+      if (hayProbe.indexOf(needle) !== -1) { truncated = true; break; }
+      continue;
+    }
+    let buf;
+    try { buf = readBuffer(path.join(root, rel)); } catch { continue; }
+    if (buf == null) continue;
+    scanned++;
+    const hay = fold ? asciiFoldBuffer(buf) : buf;
+    const result = scanLiteralBuffer(buf, hay, needle, rel, limit - hits.length);
+    for (const hit of result.hits) hits.push(hit);
+    if (result.truncated) { truncated = true; break; }
+  }
+  return {
+    ok: true,
+    data: {
+      query,
+      match: 'literal',
+      backend: 'node',
+      hits,
+      truncated,
+      scanned,
+    },
+  };
+}
+
+function nodeRegexScan(root, args, allowed, signal) {
+  const source = String(args.query || '');
+  const caseSensitive = args.caseSensitive === true;
+  const flags = 'gm' + (caseSensitive ? '' : 'i');
+  let re;
+  let countRe;
+  try {
+    re = new RegExp(source, flags);
+    countRe = new RegExp(source, 'g' + (caseSensitive ? '' : 'i'));
+  } catch (e) {
+    return { ok: false, code: 'invalid_args', error: 'invalid regex: ' + e.message };
+  }
+  const limit = patternLimit(args);
+  const hits = [];
+  let scanned = 0;
+  let truncated = false;
+  for (const rel of allowed) {
+    if (signal && signal.aborted) return { ok: false, code: 'cancelled', error: 'cancelled' };
+    let buf;
+    try { buf = readBuffer(path.join(root, rel)); } catch { continue; }
+    if (buf == null) continue;
+    scanned++;
+    const text = buf.toString('utf8');
+    let lineNo = 1;
+    let lastNl = -1;
+    let nlScan = 0;
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(text))) {
+      if (m[0].indexOf('\n') !== -1) {
+        // The legacy scanner matched line-by-line; never match across lines.
+        re.lastIndex = m.index + 1;
+        continue;
+      }
+      while (true) {
+        const nl = text.indexOf('\n', nlScan);
+        if (nl === -1 || nl >= m.index) break;
+        lineNo++;
+        lastNl = nl;
+        nlScan = nl + 1;
+      }
+      if (hits.length >= limit) { truncated = true; break; }
+      const lineStart = lastNl + 1;
+      const lineNl = text.indexOf('\n', m.index);
+      const lineEnd = lineNl === -1 ? text.length : lineNl;
+      const line = text.slice(lineStart, lineEnd);
+      // Legacy matched a line including its trailing CR, so `$` sat after it.
+      const column = m.index - lastNl + (m[0].length === 0 && text.charCodeAt(m.index) === 0x0d ? 1 : 0);
+      const start = lineStart < 2 ? 0 : text.lastIndexOf('\n', lineStart - 2) + 1;
+      let end = lineEnd;
+      if (end < text.length) {
+        const nextNl = text.indexOf('\n', end + 1);
+        end = nextNl === -1 ? text.length : nextNl;
+      }
+      countRe.lastIndex = 0;
+      let count = 0;
+      let cm;
+      while ((cm = countRe.exec(line))) {
+        count++;
+        if (cm[0].length === 0) countRe.lastIndex++;
+      }
+      hits.push({
+        path: rel,
+        from: lineNo,
+        to: lineNo,
+        line: lineNo,
+        column,
+        symbol: '',
+        score: 10,
+        reason: 'regex match',
+        snippet: text.slice(start, end).slice(0, 1200),
+        matchText: line.trim().slice(0, 300),
+        matchCount: count || 1,
+        matchIndex: m.index,
+      });
+      // One hit per line, like rg/legacy; continue at the next line start.
+      re.lastIndex = lineEnd < text.length ? lineEnd + 1 : text.length + 1;
+    }
+    if (truncated) break;
+  }
+  return {
+    ok: true,
+    data: {
+      query: source,
+      match: 'regex',
+      backend: 'node',
+      hits,
+      truncated,
+      scanned,
+    },
+  };
+}
+
+// Exact legacy semantics for Unicode case-insensitive and multiline literals.
+function nodePatternScanLegacy(root, args, allowed, signal) {
   const matcher = makeMatcher(args);
   if (matcher.error) return { ok: false, code: 'invalid_args', error: matcher.error };
   const limit = patternLimit(args);
@@ -600,6 +869,18 @@ function nodePatternScan(root, args, allowed, signal) {
       scanned,
     },
   };
+}
+
+function nodePatternScan(root, args, allowed, signal) {
+  if (args.match === 'regex') return nodeRegexScan(root, args, allowed, signal);
+  const query = String(args.query || '');
+  if (query.includes('\n') || query.includes('\r')) {
+    return nodePatternScanLegacy(root, args, allowed, signal);
+  }
+  if (args.caseSensitive !== true && !isAsciiText(query)) {
+    return nodePatternScanLegacy(root, args, allowed, signal);
+  }
+  return nodeLiteralScanFast(root, args, allowed, signal);
 }
 
 function parseRgOutput(stdout, allowed, limit) {
@@ -658,18 +939,40 @@ function hydrateHits(root, hits, args) {
   return hits;
 }
 
+function relativeScopes(root, scope) {
+  const list = Array.isArray(scope) && scope.length ? scope : ['.'];
+  const out = [];
+  for (const s of list) {
+    const abs = path.resolve(root, String(s || '.'));
+    const rel = toPosix(path.relative(root, abs));
+    if (path.isAbsolute(rel) || rel === '..' || rel.startsWith('../')) continue;
+    out.push(rel === '.' ? '' : rel);
+  }
+  return out;
+}
+
+function inScope(rel, scopes) {
+  return scopes.some((s) => s === '' || rel === s || rel.startsWith(s + '/'));
+}
+
 function preparePattern(root, args) {
-  const allowedFiles = walk(root, args.scope || ['.']);
-  const allowed = new Set(allowedFiles.map((f) => f.rel));
   let candidates = null;
   let indexMeta = null;
-  if (args.match === 'literal' && String(args.query || '').length >= 3 && args.instant !== false) {
+  const queryText = String(args.query || '');
+  // Unicode case-insensitive matching needs JS lowercasing, but the bloom is
+  // ASCII-folded; skip the index so it can never hide such a match.
+  const indexableQuery = args.caseSensitive === true || isAsciiText(queryText);
+  if (args.match === 'literal' && queryText.length >= 3 && args.instant !== false && indexableQuery) {
     try {
       const built = ensureTrigramIndex(root, { maxMs: Number(args.indexMaxMs) || 3000 });
       if (built.complete) {
         const found = trigramCandidates(built.index, args.query);
         if (found !== null) {
-          candidates = found.filter((rel) => allowed.has(rel));
+          // ensureTrigramIndex just refreshed the index from walk(), so every
+          // candidate already passed ignore/extension/secret/existence checks.
+          // Scope is the only remaining filter; skip the full tree walk.
+          const scopes = relativeScopes(root, args.scope);
+          candidates = found.filter((rel) => inScope(rel, scopes));
           indexMeta = {
             used: true,
             files: built.files,
@@ -677,6 +980,7 @@ function preparePattern(root, args) {
             candidates: candidates.length,
             durationMs: built.durationMs,
           };
+          return { allowed: new Set(candidates), candidates, indexMeta };
         }
       } else {
         indexMeta = {
@@ -690,6 +994,8 @@ function preparePattern(root, args) {
       indexMeta = { used: false, fallback: e.message };
     }
   }
+  const allowedFiles = walk(root, args.scope || ['.']);
+  const allowed = new Set(allowedFiles.map((f) => f.rel));
   return { allowed, candidates, indexMeta };
 }
 
@@ -856,9 +1162,9 @@ async function searchPatternGroupAsync(root, args, opts = {}) {
   let backend = 'node';
   let scanned = 0;
 
-  const assign = (rel, lineNo, col, line) => {
+  const assign = (rel, lineNo, col, line, subset = queries) => {
     const hay = caseSensitive ? line : line.toLowerCase();
-    for (const q of queries) {
+    for (const q of subset) {
       const needle = caseSensitive ? String(q.query) : String(q.query).toLowerCase();
       if (!hay.includes(needle)) continue;
       if (groups[q.id].hits.length >= limit) {
@@ -921,14 +1227,41 @@ async function searchPatternGroupAsync(root, args, opts = {}) {
     }
   }
 
+  const fastQueries = [];
+  const slowQueries = [];
+  for (const q of queries) {
+    const query = String(q.query);
+    const ascii = isAsciiText(query) && !query.includes('\n') && !query.includes('\r');
+    if (caseSensitive || ascii) {
+      const fold = !caseSensitive && /[A-Za-z]/.test(query);
+      fastQueries.push({
+        id: q.id,
+        needle: fold ? Buffer.from(query.toLowerCase(), 'utf8') : Buffer.from(query, 'utf8'),
+        fold,
+      });
+    } else {
+      slowQueries.push(q);
+    }
+  }
+
   for (const rel of allowed) {
     if (opts.signal && opts.signal.aborted) return { ok: false, code: 'cancelled', error: 'cancelled' };
-    let text = '';
-    try { text = readText(path.join(root, rel)) || ''; } catch {}
-    if (!text) continue;
+    let buf;
+    try { buf = readBuffer(path.join(root, rel)); } catch { continue; }
+    if (buf == null || !buf.length) continue;
     scanned++;
-    const lines = text.split('\n');
-    for (let i = 0; i < lines.length; i++) assign(rel, i + 1, 1, lines[i]);
+    let folded = null;
+    for (const fq of fastQueries) {
+      const group = groups[fq.id];
+      const hay = fq.fold ? (folded || (folded = asciiFoldBuffer(buf))) : buf;
+      const result = scanLiteralBuffer(buf, hay, fq.needle, rel, limit - group.hits.length, true);
+      for (const hit of result.hits) group.hits.push(hit);
+      if (result.truncated) group.truncated = true;
+    }
+    if (slowQueries.length) {
+      const lines = buf.toString('utf8').split('\n');
+      for (let i = 0; i < lines.length; i++) assign(rel, i + 1, 1, lines[i], slowQueries);
+    }
   }
   return { ok: true, data: { groups, scans: 1, backend, scanned } };
 }
